@@ -1,0 +1,388 @@
+---
+title: "Physical Activity HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-04"
+output: 
+ html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+
+<!--
+================================================================================
+SCRIPT:  PRG/Physiological/urine_frequency.Rmd
+PURPOSE: Data preparation pipeline for urine frequency and urine color
+         collected via survey on smartwatch during the Montreal Summer
+         2024 heatwave study. This script:
+           1. Loads daily lifestyle survey data and assigns participant IDs
+           2. Converts numeric urine color codes to descriptive labels
+           3. Removes invalid entries (urineFreq = 0)
+           4. Checks for and reports duplicate entries per participant per day
+           5. Exports the clean final dataset and QC plots
+
+INPUT FILES (DAT/):
+  - lifestyle_daily.csv             -> daily self-reported lifestyle survey
+                                       including urine frequency and color
+  - baseline_long.csv               -> participant-macID-date lookup
+                                       (from Data_preparation.Rmd)
+
+OUTPUT FILES (RES/Physiological/):
+  - urine_data_processed.csv        -> cleaned daily urine dataset
+
+DESIGN NOTE - WHY THIS SCRIPT IS SIMPLER THAN OTHER PHYSIOLOGICAL SCRIPTS:
+  Urine data comes from a daily survey (one entry per day per participant), not from continuous smartwatch monitoring. As a result:
+    - No unix timestamp exists: local_time is constructed from the date
+      column using 15:00 as a fixed arbitrary time (does not affect results)
+    - assign_study_period() is NOT called: period of day (AM/PM/NI) is not applicable to daily survey data. Period is set to "AM" by convention
+      for consistency with other dataframes in downstream analyses
+    - No sleep merge or reference-time deduplication is needed: only one
+      entry per participant per day is expected by design
+
+URINE COLOR CODING:
+  0 = white
+  1 = yellow1 (pale yellow)
+  2 = yellow2 (yellow)
+  3 = yellow3 (dark yellow)
+  4 = yellow4 (amber/brown)
+  NA or other = missing / not recorded
+
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script prepares the **urine frequency and urine color** dataset from the daily survey completed by participants during the Montreal heatwave 2024.
+
+Unlike other physiological scripts (blood pressure, body mass, oral temperature), this script does not perform sleep-based reference-time deduplication because the data source is a daily survey with at most one intended entry per participant per day. See the header block above for a full explanation of design differences.
+
+***
+# Environment setup
+
+## Load packages
+
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+required_packages <- c(
+  "here", "dplyr", "tidyr", "lubridate",
+  "ggplot2", "patchwork", "scales"
+)
+
+install_if_missing <- function(packages) {
+  missing <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing) > 0) install.packages(missing)
+}
+
+install_if_missing(required_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+
+## Set project root and directory paths
+
+```{r set-paths}
+# Anchor here() to the project root from this script's location
+here::i_am("PRG/Physiological/urine_frequency.Rmd") 
+
+path_dat <- here("DAT")         # Raw data folder
+path_prg <- here("PRG")         # Scripts folder
+path_res <- here("DAT/Processed") # Path to DAT processed folder within the project
+```
+
+## Source custom functions
+
+```{r source-functions}
+# Participant ID assignment and heatwave status labelling
+# Note: assign_study_period() is intentionally NOT used here -- see design note
+source(here("PRG/Functions/functions_participant_period.R"))
+```
+
+***
+
+# Step 1 - Load raw data and assign participant IDs {#step1}
+
+## Load raw lifestyle survey data
+
+```{r load-urine-raw}
+# Load daily lifestyle survey -- contains urine frequency, urine color,
+# and other daily lifestyle variables (steps, sleep, heart rate, etc.)
+urine_data_raw <- read.csv(
+  file.path(path_dat, "lifestyle_daily.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Load participant-macID lookup table
+
+```{r load-baseline-long}
+# baseline_long maps each macID + date range to a participant_id
+# Created by Data_preparation.Rmd -- must be run first
+baseline_long <- read.csv(
+  file.path(path_dat, "baseline_long.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Assign participant ID and heatwave status
+
+```{r assign-participant-period}
+# This dataset contains daily survey entries with a date column but no unix
+# timestamp. We construct local_time at 15:00 as a fixed arbitrary reference
+# point solely to satisfy the add_participant_id_watch() function signature.
+# The specific time chosen (15:00) does not affect participant ID matching
+# since matching is done by date range, not by exact time.
+urine_data_participant <- urine_data_raw %>%
+  mutate(
+    local_time     = as.POSIXct(paste0(date, " 15:00:00"),
+                                format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    date_converted = as.Date(date, format = "%Y-%m-%d")
+  )
+
+# Match each row to a participant_id using macID + local_time window
+urine_data_participant <- add_participant_id_watch(
+  urine_data_participant,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+
+# Assign heatwave status (BEF_HW_June / HW_June / AFT_HW_June)
+urine_data_participant <- assign_heatwave(urine_data_participant)
+
+# Restrict to heatwave monitoring window only
+urine_data_participant <- urine_data_participant %>%
+  filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June"))
+
+# Set period = "AM" by convention for all daily survey entries
+# Rationale: urine data is collected once per day with no time-of-day
+# granularity. Setting period = "AM" ensures consistency with the period
+# column used in all other physiological dataframes for downstream merging.
+urine_data_participant <- urine_data_participant %>%
+  mutate(period = "AM")
+```
+***
+
+# Step 2 - Clean urine frequency and color {#step2}
+
+## Convert urine color codes to descriptive labels
+
+Numeric urine color codes (0-4) are converted to descriptive character labels for readability in plots and exported data.
+```{r convert-urine-color}
+urine_data_participant <- urine_data_participant %>%
+  mutate(
+    urineColorResp = case_when(
+      urineColor == 0 ~ "white",    # Very pale / clear
+      urineColor == 1 ~ "yellow1",  # Pale yellow
+      urineColor == 2 ~ "yellow2",  # Yellow
+      urineColor == 3 ~ "yellow3",  # Dark yellow
+      urineColor == 4 ~ "yellow4",  # Amber / brown
+      TRUE            ~ NA_character_ # Missing or not recorded
+    )
+  )
+```
+
+## Remove invalid urine frequency entries
+
+A urineFreq value of 0 is physiologically impossible and indicates the
+participant did not complete the survey for that day. These rows are removed.
+
+```{r remove-invalid-frequency}
+final_urine_data <- urine_data_participant %>%
+  filter(urineFreq != 0)
+
+n_removed <- nrow(urine_data_participant) - nrow(final_urine_data)
+message("Rows removed (urineFreq = 0, survey not completed): ", n_removed)
+```
+
+***
+
+# Step 3 - Check for duplicate entries {#step3}
+
+Each participant should have at most one survey entry per day. Duplicates may occur if a participant submitted the survey twice on the same day.
+
+```{r check-duplicates, message=FALSE, warning=FALSE}
+# Check for multiple entries per participant per date
+# Note: date_converted already created in Step 1 -- no need to recreate it
+duplicates_check <- final_urine_data %>%
+  group_by(period, macID, date_converted, participant_id) %>%
+  summarise(duplicate_count = n(), .groups = "drop") %>%
+  filter(duplicate_count > 1)
+
+if (nrow(duplicates_check) > 0) {
+  message("Duplicates found for the following participants and dates:")
+  print(duplicates_check)
+} else {
+  message("No duplicates found: one entry per participant per day confirmed.")
+}
+```
+
+
+***
+
+# Step 4 - Final dataset and export {#step4}
+
+## Remove columns not needed for analysis
+
+```{r clean-final-columns}
+# Remove lifestyle variables not relevant to urine analysis
+# and intermediate processing columns
+final_urine_data <- final_urine_data %>%
+  select(
+    -id, -date,
+    -total_min, -charge_time, -steps,
+    -sedentary_time,
+    -hr_rest_avg, -hr_rest_min, -hr_rest_max, -hr_rest_count,
+    -hr_active_avg, -hr_active_min, -hr_active_max, -hr_active_count,
+    -error, -local_date
+  )
+```
+
+## Export processed dataset
+
+```{r export-final}
+output_file <- file.path(path_res, "urine_data_processed.csv")
+write.csv(final_urine_data, output_file, row.names = FALSE)
+message("Exported: urine_data_processed.csv (",
+        nrow(final_urine_data), " rows x ",
+        ncol(final_urine_data), " columns)")
+```
+
+
+***
+
+# Step 5 - Quality control plots {#step5}
+
+## Urine frequency: before vs. after filtering
+
+```{r plot-frequency-before-after, echo=FALSE}
+line_freq_bef <- ggplot(urine_data_participant,
+                        aes(x = date_converted, y = urineFreq)) +
+  geom_jitter(alpha = 0.8, size = 0.8, width = 0.2) +
+  labs(title = "Before filtering",
+       x = "", y = "Urine frequency (times/day)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+line_freq_aft <- ggplot(final_urine_data,
+                        aes(x = date_converted, y = urineFreq)) +
+  geom_jitter(alpha = 0.8, size = 0.8, width = 0.2) +
+  labs(title = "After filtering",
+       x = "", y = "Urine frequency (times/day)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+line_freq_bef / line_freq_aft +
+  plot_annotation(title = "Effect of data cleaning on urine frequency")
+```
+
+## Urine frequency: distribution before vs. after filtering
+
+```{r plot-frequency-histograms, echo=FALSE}
+histo_freq_bef <- ggplot(urine_data_participant, aes(x = urineFreq)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 fill = "lightblue", color = "grey", bins = 10) +
+  labs(title = "Before filtering",
+       x = "Urine frequency (times/day)", y = "Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+histo_freq_aft <- ggplot(final_urine_data, aes(x = urineFreq)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 fill = "lightblue", color = "grey", bins = 10) +
+  labs(title = "After filtering",
+       x = "Urine frequency (times/day)", y = "Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+histo_freq_bef / histo_freq_aft +
+  plot_annotation(title = "Effect of data cleaning on urine frequency distribution")
+```
+
+## Urine color: before vs. after filtering
+
+```{r plot-color-before-after, echo=FALSE}
+# Color palette matching actual urine color appearance
+urine_colors <- c(
+  "white"   = "#FFFFF0",
+  "yellow1" = "#FFF176",
+  "yellow2" = "#FFD600",
+  "yellow3" = "#FFA000",
+  "yellow4" = "#E65100"
+)
+
+line_color_bef <- ggplot(urine_data_participant,
+                         aes(x = date_converted, y = urineColorResp,
+                             color = urineColorResp)) +
+  geom_jitter(alpha = 0.8, size = 0.8, width = 0.2, height = 0.2) +
+  scale_color_manual(values = urine_colors, name = "Urine color") +
+  scale_y_discrete(limits = c("white", "yellow1", "yellow2",
+                               "yellow3", "yellow4")) +
+  labs(title = "Before filtering", x = "", y = "Urine color") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+line_color_aft <- ggplot(final_urine_data,
+                         aes(x = date_converted, y = urineColorResp,
+                             color = urineColorResp)) +
+  geom_jitter(alpha = 0.8, size = 0.8, width = 0.2, height = 0.2) +
+  scale_color_manual(values = urine_colors, name = "Urine color") +
+  scale_y_discrete(limits = c("white", "yellow1", "yellow2",
+                               "yellow3", "yellow4")) +
+  labs(title = "After filtering", x = "", y = "Urine color") +  # FIX: was "Before filtering"
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+line_color_bef / line_color_aft +
+  plot_annotation(title = "Effect of data cleaning on urine color")
+```
+
+## Urine color: proportion distribution before vs. after filtering
+
+```{r plot-color-proportions, echo=FALSE}
+histo_color_bef <- ggplot(
+  urine_data_participant %>% filter(!is.na(urineColorResp)),
+  aes(x = urineColorResp, fill = urineColorResp)
+) +
+  geom_bar(aes(y = after_stat(count / sum(count))), color = "grey") +
+  scale_fill_manual(values = urine_colors, name = "Urine color") +
+  scale_x_discrete(limits = c("white", "yellow1", "yellow2",
+                               "yellow3", "yellow4")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Before filtering", x = "Urine color", y = "Proportion") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+histo_color_aft <- ggplot(
+  final_urine_data %>% filter(!is.na(urineColorResp)),
+  aes(x = urineColorResp, fill = urineColorResp)
+) +
+  geom_bar(aes(y = after_stat(count / sum(count))), color = "grey") +
+  scale_fill_manual(values = urine_colors, name = "Urine color") +
+  scale_x_discrete(limits = c("white", "yellow1", "yellow2",
+                               "yellow3", "yellow4")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "After filtering", x = "Urine color", y = "Proportion") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+histo_color_bef / histo_color_aft +
+  plot_annotation(title = "Effect of data cleaning on urine color distribution")
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

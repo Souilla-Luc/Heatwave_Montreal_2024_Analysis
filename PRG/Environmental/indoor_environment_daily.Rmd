@@ -1,0 +1,379 @@
+---
+title: "Indoor Environment Daily HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-04"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+
+<!--
+================================================================================
+SCRIPT:  PRG/Environmental/indoor_environment_daily.Rmd
+PURPOSE: Data preparation pipeline for indoor environmental data (temperature and relative humidity) collected via environmental nodes during the Montreal heatwave 2024 . This script:
+           1. Assigns participant IDs to daily indoor environment records
+           2. Flags and removes implausible temperature and humidity values
+           3. Exports the clean final dataset and QC plots
+
+INPUT FILES (DAT/):
+  - environmental_daily.csv         -> daily indoor temp and RH per node
+  - baseline_long.csv               -> participant-macID-date lookup
+                                       (from Data_preparation.Rmd)
+
+OUTPUT FILES (DAT/Processed/):
+  - indoor_environment_processed.csv -> cleaned daily indoor environment data
+
+IMPLAUSIBLE VALUE THRESHOLDS:
+  Temperature : temp_avg < 4 or > 50 deg C
+  Relative humidity : rh_avg < 1 or > 100 %
+
+HEATWAVE PERIODS (consistent with assign_heatwave()):
+  Before heatwave : 2024-06-11 to 2024-06-17
+  During heatwave : 2024-06-18 to 2024-06-20
+  After heatwave  : 2024-06-21 to 2024-06-27
+
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script prepares the **indoor environment** dataset from daily temperature and relative humidity measurements collected via environmental nodes placed in participants' homes during the Montreal Summer 2024 heatwave study.
+
+***
+
+# Environment setup
+
+## Load packages
+
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+required_packages <- c(
+  "here", "dplyr", "tidyr", "lubridate",
+  "ggplot2", "patchwork"
+)
+
+install_if_missing <- function(packages) {
+  missing <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing) > 0) install.packages(missing)
+}
+
+install_if_missing(required_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+
+## Set project root and directory paths
+
+```{r set-paths}
+here::i_am("PRG/Environmental/indoor_environment_daily.Rmd")
+
+path_dat <- here("DAT")           # Raw data folder
+path_prg <- here("PRG")           # Scripts folder
+path_res <- here("DAT/Processed") # Output folder for processed data
+```
+
+## Source custom functions
+
+```{r source-functions}
+source(here("PRG/Functions/functions_participant_period.R"))
+```
+
+
+***
+
+# Step 1 - Load raw data and assign participant IDs {#step1}
+
+## Load raw indoor environment data
+```{r IndEnv-upload}
+# Load daily indoor environment data from environmental nodes
+indoor_environment_raw <- read.csv(
+  file.path(path_dat, "environmental_daily.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Load participant-macID lookup table
+
+```{r load-baseline-long}
+baseline_long <- read.csv(
+  file.path(path_dat, "baseline_long.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Assign participant ID and heatwave status
+
+```{r IndEnv-assign-participant}
+# Step 1a: assign_study_period() called with "temp_min_unix" because this
+# dataset does not have a standard "unix" column.
+# The function creates "temp_min_unix_time_converted" which is renamed below.
+indoor_environment_participant <- assign_study_period(
+  indoor_environment_raw, c("temp_min_unix")
+)
+
+# Step 1b: Create local_time from sampling_date for participant ID matching
+indoor_environment_participant <- indoor_environment_participant %>%
+  mutate(
+    local_time = as.POSIXct(sampling_date, format = "%d/%m/%Y", tz = "UTC")
+  )
+
+# Step 1c: Match each row to a participant_id using macID + local_time
+indoor_environment_participant <- add_participant_id_watch(
+  indoor_environment_participant,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+
+# Step 1d: Rename time column for compatibility with assign_heatwave()
+indoor_environment_participant <- indoor_environment_participant %>%
+  rename(unix_time_converted = temp_min_unix_time_converted)
+
+# Step 1e: Assign heatwave status and restrict to monitoring window
+indoor_environment_participant <- assign_heatwave(indoor_environment_participant)
+
+indoor_environment_participant <- indoor_environment_participant %>%
+  filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June"))
+```
+
+
+***
+
+# Step 2 - Check measurement coverage {#step2}
+
+Visualize the number of measurements per participant per day to identify
+missing days or unexpected duplicates.
+
+
+
+ 
+```{r IndEnv-coverage-heatmap, echo=FALSE}
+all_participants <- sort(unique(indoor_environment_participant$participant_id))
+n_per_page       <- 4
+n_pages          <- ceiling(length(all_participants) / n_per_page)
+
+for (i in seq_len(n_pages)) {
+  start_idx         <- (i - 1) * n_per_page + 1
+  end_idx           <- min(i * n_per_page, length(all_participants))
+  participants_page <- all_participants[start_idx:end_idx]
+
+  subset_page <- indoor_environment_participant %>%
+    filter(participant_id %in% participants_page)
+
+  indoor_env_summary <- subset_page %>%
+    group_by(participant_id, date_converted) %>%
+    summarise(n_measurements = n(), .groups = "drop")
+
+  heatmap_indiv_day <- ggplot(
+    indoor_env_summary,
+    aes(x = date_converted, y = "", fill = n_measurements)
+  ) +
+    geom_tile(color = "grey") +
+    scale_fill_gradient(
+      low    = "lightblue",
+      high   = "darkblue",
+      limits = c(1, max(indoor_env_summary$n_measurements)),
+      breaks = function(x) unique(floor(pretty(x))),
+      name   = "Number of\nmeasurements"
+    ) +
+    facet_wrap(~ participant_id, nrow = 2, ncol = 2) +
+    labs(title = "Indoor environment measurements per day",
+         x = "", y = "Days of measurement") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  print(heatmap_indiv_day)
+}
+```
+
+***
+
+# Step 3 - Flag implausible values {#step3}
+
+Implausible values are flagged based on physiologically and physically
+plausible indoor ranges:
+
+| Variable | Flag condition |
+|---|---|
+| temp_avg | < 4 deg C (below freezing, implausible indoors) or > 50 deg C (sensor error) |
+| rh_avg | < 1% or > 100% (physically impossible) |
+
+
+
+```{r IndEnv-flag-implausible}
+indoor_environment_participant <- indoor_environment_participant %>%
+  mutate(
+    temp_flag = case_when(
+      is.na(temp_avg)  ~ NA_real_,
+      temp_avg < 4     ~ 1,   
+      temp_avg > 50    ~ 1,   
+      TRUE             ~ 0
+    ),
+    rh_flag = case_when(
+      is.na(rh_avg)    ~ NA_real_,
+      rh_avg < 1       ~ 1,   
+      rh_avg > 100     ~ 1,   
+      TRUE             ~ 0
+    )
+  )
+
+# Summary of flagged values
+message("=== Temperature implausible values ===")
+message("N implausible: ",
+        sum(indoor_environment_participant$temp_flag == 1, na.rm = TRUE))
+message("% implausible: ",
+        round(mean(indoor_environment_participant$temp_flag == 1,
+                   na.rm = TRUE) * 100, 2), "%")
+
+message("=== Relative humidity implausible values ===")
+message("N implausible: ",
+        sum(indoor_environment_participant$rh_flag == 1, na.rm = TRUE))
+message("% implausible: ",
+        round(mean(indoor_environment_participant$rh_flag == 1,
+                   na.rm = TRUE) * 100, 2), "%")
+```
+
+
+## Visualize flagged values before removal
+
+```{r IndEnv-plot-before, echo=FALSE}
+indoor_env_data_subset <- indoor_environment_participant %>%
+  mutate(
+    measurement_type = case_when(
+      temp_flag == 1 ~ "temp_flag",
+      rh_flag   == 1 ~ "rh_flag",
+      TRUE           ~ "Valid"
+    ),
+    measurement_type = factor(measurement_type,
+                               levels = c("Valid", "temp_flag", "rh_flag"))
+  ) %>%
+  group_by(participant_id, date_converted) %>%
+  mutate(n_measurements = n()) %>%
+  ungroup()
+
+flag_colors <- c("Valid"     = "#2E86AB",
+                 "temp_flag" = "#F6AE2D",
+                 "rh_flag"   = "#E63946")
+flag_shapes <- c("Valid"     = 16,
+                 "temp_flag" = 17,
+                 "rh_flag"   = 4)
+
+line_temp_pooled_flagged <- ggplot(
+  indoor_env_data_subset,
+  aes(x = date_converted, y = temp_avg)
+) +
+  geom_point(aes(color = measurement_type, shape = measurement_type),
+             size = 2.5, alpha = 0.85) +
+  scale_color_manual(values = flag_colors, name = "Type") +
+  scale_shape_manual(values = flag_shapes, name = "Type") +
+  labs(title = "Before filtering",
+       x = "", y = "Average indoor temperature (deg C)") +
+  theme_minimal() +
+  theme(legend.position  = "right",
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 10))
+print(line_temp_pooled_flagged)
+
+line_rh_pooled_flagged <- ggplot(
+  indoor_env_data_subset,
+  aes(x = date_converted, y = rh_avg)
+) +
+  geom_point(aes(color = measurement_type, shape = measurement_type),
+             size = 2.5, alpha = 0.85) +
+  scale_color_manual(values = flag_colors, name = "Type") +
+  scale_shape_manual(values = flag_shapes, name = "Type") +
+  labs(title = "Before filtering",
+       x = "", y = "Average indoor relative humidity (%)") +
+  theme_minimal() +
+  theme(legend.position  = "right",
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 10))
+print(line_rh_pooled_flagged)
+```
+
+
+## Remove flagged values
+
+```{r IndEnv-remove-flagged}
+cleaned_indoor_env <- indoor_env_data_subset %>%
+  filter(temp_flag == 0 & rh_flag == 0)
+
+n_removed <- nrow(indoor_env_data_subset) - nrow(cleaned_indoor_env)
+message("Rows removed (implausible temperature or humidity): ", n_removed)
+```
+
+
+## Visualize after removal
+
+```{r IndEnv-plot-after, echo=FALSE}
+line_temp_pooled_after <- ggplot(
+  cleaned_indoor_env,
+  aes(x = date_converted, y = temp_avg)
+) +
+  geom_point(color = "#2E86AB", size = 2.5, alpha = 0.85) +
+  labs(title = "After filtering",
+       x = "", y = "Average indoor temperature (deg C)") +
+  theme_minimal() +
+  theme(legend.position  = "right",
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 10))
+
+line_rh_pooled_after <- ggplot(
+  cleaned_indoor_env,
+  aes(x = date_converted, y = rh_avg)
+) +
+  geom_point(color = "#2E86AB", size = 2.5, alpha = 0.85) +
+  labs(title = "After filtering",
+       x = "", y = "Average indoor relative humidity (%)") +
+  theme_minimal() +
+  theme(legend.position  = "right",
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 10))
+
+line_temp_pooled_flagged / line_temp_pooled_after +
+  plot_annotation(title = "Effect of data cleaning on average indoor temperature")
+
+line_rh_pooled_flagged / line_rh_pooled_after +
+  plot_annotation(title = "Effect of data cleaning on average indoor relative humidity")
+```
+
+***
+
+# Step 4 - Final dataset and export {#step4}
+
+## Remove intermediate processing columns
+
+```{r IndEnv-clean-final}
+final_indoor_environment_data <- cleaned_indoor_env %>%
+  select(
+    -temp_min_unix, -temp_max_unix, -rh_min_unix, -rh_max_unix,
+    -local_time, -local_date,
+    -temp_flag, -rh_flag,
+    -measurement_type, -n_measurements, -sampling_date, -id, -period, -unix_time_converted
+  )
+```
+
+## Export processed dataset
+
+```{r IndEnv-export}
+output_file <- file.path(path_res, "indoor_environment_processed.csv")
+write.csv(final_indoor_environment_data, output_file, row.names = FALSE)
+message("Exported: indoor_environment_processed.csv (",
+        nrow(final_indoor_environment_data), " rows x ",
+        ncol(final_indoor_environment_data), " columns)")
+```
+
+***
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

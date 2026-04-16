@@ -1,0 +1,544 @@
+---
+title: "Main Analysis Perceptuals HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+<!--
+================================================================================
+SCRIPT:  PRG/Perceptuals/main_analysis_perceptuals.Rmd
+PURPOSE: Descriptive and inferential analysis of perceptual survey responses collected during the Montreal Summer 2024 heatwave study. This script:
+           1. Loads the cleaned survey dataset
+           2. Assigns AC status to participants
+           3. Produces descriptive statistics tables by heatwave period
+           4. Produces violin plots, bar charts, and heatmap plots
+           5. Runs Cumulative Link Mixed Models (CLMM) for ordinal outcomes
+           6. Runs Generalized Linear Mixed Models (glmmTMB) for binary outcomes
+
+INPUT FILES (DAT/Processed/):
+  - survey_processed.csv   -> cleaned perceptual survey responses (long format)
+
+OUTPUT FILES (RES/Perceptuals/):
+  - Table/survey_descriptive_tables.xlsx
+  - Graph/violin_ordinal_period.png
+  - Graph/violin_ordinal_heatwave.png
+  - Graph/chart_ordinal_period.png
+  - Graph/chart_ordinal_heatwave.png
+  - Graph/ (additional plots saved by custom functions)
+
+SURVEY KEYS ANALYSED:
+  Ordinal    : sleep
+  Categorical: preference, sensation, thirst, sleep
+  Binary     : comfort, at-home, sweating
+
+STATISTICAL APPROACH:
+  Ordinal outcomes  -> Cumulative Link Mixed Models (CLMM, ordinal package)
+  Binary outcomes   -> Generalized Linear Mixed Models (glmmTMB package)
+    Post-hoc        -> marginaleffects (population-averaged risk ratios)
+
+AC STATUS NOTE:
+  Air conditioning status derived from participant self-report at baseline. Hardcoded list verified against characteristics_participants.csv.
+
+HEATWAVE PERIODS:
+  Before heatwave : 2024-06-11 to 2024-06-17
+  During heatwave : 2024-06-18 to 2024-06-20
+  After heatwave  : 2024-06-21 to 2024-06-27
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script performs descriptive and inferential analyses of perceptual survey responses collected during the Montreal Summer 2024 heatwave study. Survey outcomes are divided into ordinal (sleep, thirst), categorical (preference, sensation), and binary (comfort, at-home, sweating) variables, each analysed with an appropriate statistical model.
+
+---
+
+# Environment setup
+
+## Load packages
+
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+required_packages <- c(
+  # Data wrangling
+  "here", "dplyr", "tidyr", "lubridate", "stringr", "purrr",
+  # Reporting
+  "knitr", "kableExtra", "openxlsx",
+  # Visualization
+  "ggplot2", "patchwork", "viridis", "ggeffects",
+  # Statistical modelling
+  "rstatix", "carData", "car", "emmeans", "mmrm",
+  "mlogit", "ordinal", "glmmTMB"
+)
+
+install_if_missing <- function(packages) {
+  missing_packages <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing_packages) > 0) {
+    install.packages(missing_packages)
+  }
+}
+
+load_packages <- function(packages) {
+  lapply(packages, library, character.only = TRUE)
+}
+
+install_if_missing(required_packages)
+load_packages(required_packages)
+```
+
+## Set project root and directory paths
+
+```{r set-paths, message=FALSE, warning=FALSE, include=FALSE}
+here::i_am("PRG/Perceptuals/main_analysis_perceptuals.Rmd")
+```
+
+```{r define-paths}
+path_dat <- here("DAT/Processed")      # Processed data inputs
+path_prg <- here("PRG")                # Scripts folder
+path_res <- here("RES/Perceptuals")    # Results output folder
+```
+
+## Set global color palette
+
+```{r set-color-palette, echo=FALSE, warning=FALSE}
+scale_color_discrete <- function(...) scale_color_viridis_d(...)
+scale_fill_discrete  <- function(...) scale_fill_viridis_d(...)
+```
+
+## Source custom analysis functions
+
+```{r source-functions}
+# All custom functions used in this script
+# See each .R file in PRG/Functions/ for full documentation
+source(here("PRG/Functions/functions_cleaning_data.R"))
+source(here("PRG/Functions/functions_descriptive_stats.R"))  # descriptive_stats(), display_table(), create_survey_datasets(), get_variable_summary()
+source(here("PRG/Functions/functions_descriptive_plot.R"))   # violin_plot_ordinal(), chart_categorical(), heatmap_plot_long(), heatmap_plot_facets_fixed()
+source(here("PRG/Functions/functions_linear_models.R"))      # ordinal_mm(), glmmTMB_model(), clmm_recovery(), glmmTMB_recovery()
+source(here("PRG/Functions/residual_check_mmrm.R"))
+source(here("PRG/Functions/functions_check_clmm.R"))         # ordinal_mm_assumptions()
+```
+
+---
+
+# Load processed data {#load-data}
+
+```{r load-data}
+# Load cleaned survey responses (long format: one row per key per participant per response)
+final_survey_data <- read.csv(
+  file.path(path_dat, "survey_processed.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Assign AC status
+
+```{r define-ac-status}
+# Participants with air conditioning access at home
+# Verified against characteristics_participants.csv (ApartmentAC column)
+# Hardcoded for reproducibility -- update if study population changes
+participants_with_AC <- c(
+  "P01", "P02", "P03", "P04", "P06", "P08", "P09", "P10",
+  "P11", "P13", "P16", "P17", "P19", "P21", "P24", "P25", "P26"
+)
+
+# Add binary AC indicator (1 = AC access, 0 = no AC)
+final_survey_data$AC <- ifelse(
+  final_survey_data$participant_id %in% participants_with_AC, 1, 0
+)
+```
+
+---
+
+# Descriptive statistics {#descriptive-stats}
+
+## Prepare survey datasets by key
+
+```{r survey-concatenate-survey-data, echo=FALSE, message=FALSE, warning=FALSE}
+# Define the seven survey keys of interest
+survey_keys <- c("sleep", "comfort", "sensation", "preference",
+                 "sweating", "at-home", "thirst")
+
+# Split the long-format survey data into one dataframe per key
+# using the custom create_survey_datasets() function
+survey_datasets <- create_survey_datasets(final_survey_data, survey_keys)
+
+# Remove any datasets missing one or more heatwave periods
+# (e.g., keys with no responses during HW_June would be excluded)
+required_statuses <- c("BEF_HW_June", "HW_June", "AFT_HW_June")
+survey_datasets <- survey_datasets[
+  sapply(survey_datasets, function(df) all(required_statuses %in% unique(df$heatwave_status)))
+]
+
+# Print a summary of available responses per key per period
+survey_summary <- get_variable_summary(survey_datasets)
+print(survey_summary)
+```
+
+## Define analysis variable lists
+
+```{r survey-create-data-list-outcome, echo=FALSE}
+# data_list_survey: named list mapping keys to processed survey dataframes
+# Sleep is filtered to AM only -- per protocol, the sleep questionnaire was completed in the morning (once per day), not 3x daily
+data_list_survey <- list(
+  sleep      = survey_datasets$survey_sleep %>% filter(period == "AM"),
+  comfort    = survey_datasets$survey_comfort,
+  preference = survey_datasets$survey_preference,
+  sensation  = survey_datasets$survey_sensation,
+  at_home    = survey_datasets$survey_at_home,
+  sweating   = survey_datasets$survey_sweating,
+  thirst     = survey_datasets$survey_thirst
+)
+
+# outcome_variables_survey: named list specifying each survey outcome
+# Fields: data = key in data_list_survey, var = numeric value column,
+#         resp = character response label column
+outcome_variables_survey <- list(
+  "Sleep"      = list(data = "sleep",      var = "value", resp = "resp"),
+  "Comfort"    = list(data = "comfort",    var = "value", resp = "resp"),  
+  "Preference" = list(data = "preference", var = "value", resp = "resp"),
+  "Sensation"  = list(data = "sensation",  var = "value", resp = "resp"),
+  "At_home"    = list(data = "at_home",    var = "value", resp = "resp"),
+  "Sweating"   = list(data = "sweating",   var = "value", resp = "resp"),
+  "Thirst"     = list(data = "thirst",     var = "value", resp = "resp")
+)
+```
+
+## Compute descriptive statistics tables
+
+Three grouping options are computed:
+
+- **Option 1** (`Participant_HW_Period`): participant-weighted, grouped by
+  heatwave period × period of day (AM/PM/NI) -- recommended for publication
+- **Option 2** (`Participant_Period`): participant-weighted, grouped by
+  heatwave period only -- for outcomes without period-of-day granularity
+- **Option 3** (`Pooled_Heatwave`): pooled across participants, grouped by
+  heatwave period -- for sensitivity comparison
+
+```{r survey-descriptive-tables}
+# Option 1: participant-weighted, grouped by heatwave x period of day
+outcome_table_participant_survey <- descriptive_stats(
+  data_list_survey,
+  outcome_variables_survey,
+  group_by_participant = TRUE,
+  group_by             = "heatwave_period",
+  categorical_grouping = FALSE,
+  numeric_variable     = FALSE
+)
+display_table(outcome_table_participant_survey)
+
+# Option 2: participant-weighted, grouped by heatwave period only
+
+outcome_table_heatwave_survey <- descriptive_stats(
+  data_list_survey,
+  outcome_variables_survey,
+  group_by_participant = TRUE,
+  group_by             = "heatwave",
+  categorical_grouping = FALSE,
+  numeric_variable     = FALSE
+)
+display_table(outcome_table_heatwave_survey)
+
+# Option 3: pooled across participants, grouped by heatwave period (categorical)
+outcome_table_pooled_heatwave_survey <- descriptive_stats(
+  data_list_survey,
+  outcome_variables_survey,
+  group_by_participant = FALSE,
+  group_by             = "heatwave",
+  categorical_grouping = TRUE,
+  numeric_variable     = FALSE
+)
+display_table(outcome_table_pooled_heatwave_survey)
+```
+
+## Save descriptive tables to Excel
+
+```{r save-survey-tables}
+wb <- createWorkbook()
+
+# Sheet 1: participant-weighted, by heatwave x period of day
+addWorksheet(wb, "Participant_HW_Period")
+writeData(wb, "Participant_HW_Period", outcome_table_participant_survey$stats)
+
+# Sheet 2: participant-weighted, by heatwave period only
+addWorksheet(wb, "Participant_HW")
+writeData(wb, "Participant_HW", outcome_table_heatwave_survey$stats)
+
+# Sheet 3: pooled across participants, by heatwave period
+addWorksheet(wb, "Pooled_Heatwave")
+writeData(wb, "Pooled_Heatwave", outcome_table_pooled_heatwave_survey$freq)
+
+saveWorkbook(
+  wb,
+  file      = here("RES/Perceptuals/Table/survey_descriptive_tables.xlsx"),
+  overwrite = TRUE
+)
+# FIX: path in message corrected from "RES/Survey/Table/" to "RES/Perceptuals/Table/"
+message("Survey tables saved to RES/Perceptuals/Table/survey_descriptive_tables.xlsx")
+```
+
+
+---
+
+# Descriptive plots {#descriptive-plots}
+
+## Ordinal variables: violin plots
+
+Ordinal variables (sleep and thirst) are visualized using violin plots showing the distribution of responses across periods of the day and heatwave periods.
+
+```{r survey-plot-violin, echo=TRUE, fig.height=13, fig.width=19, message=FALSE, warning=FALSE}
+# Ordinal variables: sleep (AM only) and thirst
+data_list_survey_ordinal <- list(
+  sleep  = survey_datasets$survey_sleep %>% filter(period == "AM"),
+  thirst = survey_datasets$survey_thirst
+)
+
+outcome_variables_survey_ordinal <- list(
+  "Sleep"  = list(data = "sleep",  var = "value", resp = "resp"),
+  "Thirst" = list(data = "thirst", var = "value", resp = "resp")
+)
+
+# Violin plot by period of day
+violin_period_ordinal <- violin_plot_ordinal(
+  data_list_survey_ordinal,
+  outcome_variables_survey_ordinal,
+  plot_type = "period"
+)
+print(violin_period_ordinal)
+
+# Violin plot by heatwave period
+violin_heatwave_ordinal <- violin_plot_ordinal(
+  data_list_survey_ordinal,
+  outcome_variables_survey_ordinal,
+  plot_type = "heatwave"
+)
+print(violin_heatwave_ordinal)
+```
+
+```{r save-violin-plots}
+ggsave(
+  filename = here("RES/Perceptuals/Graph/violin_ordinal_period.png"),
+  plot     = violin_period_ordinal,
+  width = 10, height = 6, dpi = 300, bg = "white"
+)
+
+ggsave(
+  filename = here("RES/Perceptuals/Graph/violin_ordinal_heatwave.png"),
+  plot     = violin_heatwave_ordinal,
+  width = 10, height = 6, dpi = 300, bg = "white"
+)
+```
+
+## Categorical variables: bar charts
+
+Categorical variables (preference, sensation, thirst) are visualized as
+proportional bar charts. The y-axis represents the proportion of responses (1 = 100%).
+
+> Note: these charts do not account for multiple measurements per participant within the same period or heatwave status.
+
+```{r survey-create-dataset-categorical, echo=TRUE, fig.height=16, fig.width=18, message=FALSE, warning=FALSE}
+# Categorical variables: preference (-1/0/1), sensation (-1/0/1), thirst (0/1/2)
+# Sleep commented out -- if analysing sleep with CLMM, modify clmm_model() accordingly
+data_list_survey_categorical <- list(
+  preference = survey_datasets$survey_preference,
+  sensation  = survey_datasets$survey_sensation,
+  thirst     = survey_datasets$survey_thirst,
+  sleep      = survey_datasets$survey_sleep %>% filter(period == "AM")
+)
+
+outcome_variables_survey_categorical <- list(
+  "Preference" = list(data = "preference", var = "value", levels = c(-1, 0, 1),   resp = "resp"),
+  "Sensation"  = list(data = "sensation",  var = "value", levels = c(-1, 0, 1),   resp = "resp"),
+  "Thirst"     = list(data = "thirst",     var = "value", levels = c(0, 1, 2),    resp = "resp")
+  # "Sleep"    = list(data = "sleep", var = "value", levels = c(1,2,3,4,5), resp="resp")
+  # Uncomment above to include sleep in CLMM -- modify clmm_model() function accordingly
+)
+```
+
+```{r survey-categorical-barchart, echo=FALSE, fig.height=10, fig.width=12, message=FALSE, warning=FALSE}
+# Bar chart by period of day
+p_period <- chart_categorical(
+  data_list_survey_categorical,
+  outcome_variables_survey_categorical,
+  chart_type = "period"
+)
+
+# Bar chart by heatwave period
+p_hw <- chart_categorical(
+  data_list_survey_categorical,
+  outcome_variables_survey_categorical,
+  chart_type = "heatwave"
+)
+
+ggsave(
+  filename = here("RES/Perceptuals/Graph/chart_ordinal_period.png"),
+  plot     = p_period,
+  width = 10, height = 6, dpi = 300, bg = "white"
+)
+
+ggsave(
+  filename = here("RES/Perceptuals/Graph/chart_ordinal_heatwave.png"),
+  plot     = p_hw,
+  width = 10, height = 6, dpi = 300, bg = "white"
+)
+```
+
+## Binary variables: heatmap plots
+
+Binary variables (comfort, at-home, sweating) are visualized as heatmaps
+showing the mean response score per day per period. The color gradient
+represents the mean score within each cell.
+
+> Legend:
+> - Comfort/sweating: 0 = no, 1 = yes
+> - Sensation/preference: -1 = cold/cooler, 0 = neutral/no change, 1 = hot/hotter
+> - Thirst: 0 = no, 1 = a little, 2 = very thirsty
+> - At-home: 1 = yes, 0 = no
+
+```{r survey-define-binary-list, echo=FALSE}
+# Binary variables: comfort (0/1), at-home (1-4), sweating (0/1)
+data_list_survey_binary <- list(
+  comfort = survey_datasets$survey_comfort,
+  at_home = survey_datasets$survey_at_home,
+  sweating = survey_datasets$survey_sweating
+)
+
+outcome_variables_survey_binary <- list(
+  "Comfort"  = list(data = "comfort",  var = "value", resp = "resp"),
+  "At_home"  = list(data = "at_home",  var = "value", resp = "resp"),
+  "Sweating" = list(data = "sweating", var = "value", resp = "resp")
+)
+```
+
+```{r survey-binary-heatmap-plot, message=FALSE, warning=FALSE}
+# Heatmap by heatwave period x period of day
+heatmap_plot_long(
+  data_list_survey_binary,
+  outcome_variables_survey_binary,
+  output_dir = here("RES/Perceptuals/Graph"),
+  plot_type  = "heatwave_period"
+)
+```
+
+```{r survey-binary-heatmap-plot-AC, message=FALSE, warning=FALSE}
+# Heatmap split by AC status
+heatmap_plot_long_AC(
+  data_list_survey_binary,
+  outcome_variables_survey_binary,
+  output_dir = here("RES/Perceptuals/Graph")
+)
+```
+
+```{r survey-categorical-heatmap}
+# Faceted heatmap for categorical variables
+heatmap_plot_facets_fixed(
+  data_list_survey_categorical,
+  outcome_variables_survey_categorical,
+  output_dir = here("RES/Perceptuals/Graph")
+)
+```
+
+```{r survey-categorical-heatmap-AC}
+# Faceted heatmap for categorical variables split by AC status
+heatmap_plot_facets_fixed_AC(
+  data_list_survey_categorical,
+  outcome_variables_survey_categorical,
+  output_dir = here("RES/Perceptuals/Graph")
+)
+```
+
+---
+
+# Statistical analysis {#statistical-analysis}
+
+## Cumulative Link Mixed Models (CLMM) for ordinal outcomes
+
+CLMMs are designed for ordinal outcomes by linking a latent continuous
+variable to observed ordinal responses via a nonlinear link function (logit,
+probit, or complementary log-log). Random effects account for within-subject
+variability across repeated measurements.
+
+See `PRG/Functions/functions_linear_models.R` for model specification details.
+
+```{r survey-clmm, message=FALSE, warning=FALSE}
+# Main effect of heatwave period on ordinal outcomes (preference, sensation, thirst)
+ordinal_mm(data_list_survey_categorical, outcome_variables_survey_categorical)
+```
+
+### CLMM assumption checks
+
+```{r survey-clmm-assumptions, eval=FALSE, include=FALSE}
+# Verify proportional odds assumption and other CLMM diagnostics
+ordinal_mm_assumptions(data_list_survey_categorical, outcome_variables_survey_categorical)
+```
+
+### Effect of air conditioning on ordinal outcomes
+
+```{r survey-clmm-AC}
+# CLMM including AC status as a moderator variable
+ordinal_mm_AC(data_list_survey_categorical, outcome_variables_survey_categorical)
+```
+
+
+### Recovery analysis for ordinal outcomes
+
+```{r survey-clmm-recovery}
+# CLMM focused on post-heatwave recovery (AFT vs BEF comparison)
+clmm_recovery(data_list_survey_categorical, outcome_variables_survey_categorical)
+```
+
+---
+
+## Generalized Linear Mixed Models (glmmTMB) for binary outcomes
+
+`glmmTMB` fits generalized linear mixed models using the Template Model
+Builder (TMB) backend for speed and flexibility. It is used here for binary
+outcomes (comfort, at-home, sweating).
+
+**Post-hoc: population-averaged risk ratios via `marginaleffects`**
+
+For nonlinear models (e.g., logistic regression), differences on the log-odds
+scale do not translate directly into risk ratios. `marginaleffects` computes
+population-averaged contrasts on the response scale (probabilities / risk
+ratios), averaging over the random effects distribution. This provides more
+interpretable estimates than `emmeans` for binary outcomes.
+
+```{r survey-glmmTMB-main, message=FALSE, warning=FALSE}
+# Main effect of heatwave period on binary outcomes (comfort, at-home, sweating)
+# Results stored but displayed within the function
+glmmTMB_model(data_list_survey_binary, outcome_variables_survey_binary)
+```
+
+### Effect of air conditioning on binary outcomes
+
+```{r survey-glmmTMB-AC, message=FALSE, warning=FALSE}
+# glmmTMB including AC status as a moderator
+glmmTMB_model_AC(data_list_survey_binary, outcome_variables_survey_binary)
+```
+
+### Recovery analysis for binary outcomes
+
+```{r survey-glmmTMB-recovery, message=FALSE, warning=FALSE}
+# glmmTMB focused on post-heatwave recovery period
+glmmTMB_recovery(data_list_survey_binary, outcome_variables_survey_binary)
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

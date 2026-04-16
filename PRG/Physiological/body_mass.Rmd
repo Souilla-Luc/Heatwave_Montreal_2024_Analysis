@@ -1,0 +1,622 @@
+---
+title: "Body Mass HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-04"
+output:   
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+<!--
+================================================================================
+SCRIPT:  PRG/Physiological/body_mass.Rmd
+PURPOSE: Full data preparation pipeline for body mass collected via 
+         scale during the Montreal heatwave 2024. This script:
+           1. Assigns participant IDs and study periods to raw body mass data
+           2. Retains only morning (AM) measurements per protocol
+           3. Flags and removes implausible daily variations (> 4 kg)
+           4. Removes duplicate measurements per period using sleep-based reference times (awakening)
+           5. Computes daily delta body mass
+           6. Exports the clean final dataset and QC plots
+
+INPUT FILES (DAT/):
+  - body_mass.csv                   → raw smartwatch scale measurements
+  - baseline_long.csv               → participant–macID–date lookup
+                                      (from Data_preparation.Rmd)
+  - sleep_analysis_daily.csv        → daily sleep start/end times per participant
+
+OUTPUT FILES (RES/Physiological/):
+  - body_mass_processed.csv         → cleaned, one-measurement-per-day body mass
+
+DEPENDENCIES:
+  - PRG/Functions/functions_participant_period.R   (assign_study_period, add_participant_id_watch, assign_heatwave)
+  - PRG/Functions/functions_cleaning_data.R        (set_reference_time, get_surrounding_indices, remove_farthest_measure)
+
+IMPLAUSIBLE VALUE THRESHOLD:
+  - Daily body mass variation > 4 kg flagged and removed
+
+PROTOCOL NOTE:
+  Participants were instructed to measure body mass in the morning only
+  (before noon). PM and NI measurements are therefore treated as protocol errors and removed.
+
+TIMEZONE NOTE:
+  All Unix timestamps are stored in UTC. Montreal operates on EDT (UTC-4) during the study period (June 2024). 
+
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script prepares the **body mass** dataset collected via smartwatch and scale during the Montreal heatwave 2024 . It follows the three-step
+pipeline defined in `Data_preparation.Rmd`:
+
+1. **`body_mass_raw`** — raw upload and participant ID assignment
+2. **`body_mass_participant`** — period filtering, implausible variation flagging
+3. **`final_body_mass_data`** — deduplication, delta mass adjustment, export
+
+***
+
+# Environment setup
+
+## Load packages
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+# Minimal package set required for this script
+
+required_packages <- c(
+  "here", "dplyr", "tidyr", "lubridate",
+  "ggplot2", "patchwork", "purrr", "scales"
+)
+
+install_if_missing <- function(packages) {
+  missing <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing) > 0) install.packages(missing)
+}
+
+install_if_missing(required_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+## Set project root and directory paths
+```{r set-paths}
+# Anchor here() to the project root from this script's location
+here::i_am("PRG/Physiological/body_mass.Rmd")  
+
+
+# Define paths using 'here' to get project-relative paths
+path_dat <- here("DAT")         # Raw data folder
+path_prg <- here("PRG")         # Scripts folder
+path_res <- here("DAT/Processed")# Output folder for physiological processed data
+```
+
+## Source custom functions
+
+```{r source-functions}
+# Load participant ID assignment and period labelling functions
+source(here("PRG/Functions/functions_participant_period.R"))
+
+# Load reference-time selection and deduplication functions
+# Note: this file depends on purrr (loaded above)
+source(here("PRG/Functions/functions_cleaning_data.R"))
+```
+
+***
+# Step 1 — Load raw data and assign participant IDs {#step1}
+
+## Load raw body mass data
+```{r load-bm-raw}
+body_mass_raw <- read.csv(
+  file.path(path_dat, "body_mass.csv"),
+  header = TRUE, sep = ";", quote = "\"'", dec = "."
+)
+```
+
+```{r load-baseline-long}
+# baseline_long maps each macID + date range to a participant_id
+# Created by Data_preparation.Rmd — must be run first
+baseline_long <- read.csv(
+  file.path(path_dat, "baseline_long.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Assign study period, participant ID, and heatwave status
+
+```{r assign-participant-period}
+# Step 1a: Convert unix timestamp and assign period of day (AM / PM / NI)
+body_mass_participant <- assign_study_period(body_mass_raw, c("unix"))
+
+# Step 1b: Match each row to a participant_id using macID + local_time window
+body_mass_participant <- add_participant_id_watch(
+  body_mass_participant,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+
+# Step 1c: Assign heatwave status (BEF_HW_June / HW_June / AFT_HW_June)
+body_mass_participant <- assign_heatwave(body_mass_participant)
+
+# Restrict to the heatwave monitoring window only
+body_mass_participant <- body_mass_participant %>%
+  filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June"))
+```
+
+***
+
+# Step 2 — Protocol filter: morning measurements only {#step2}
+Per study protocol, participants were instructed to measure body mass in the morning only (before noon). Measurements recorded during PM or NI periods are treated as protocol deviations and flagged before removal.
+
+## Visualize measurement timing by participant
+
+```{r plot-measurement-hour, echo=FALSE, fig.height=8, fig.width=15}
+
+all_participants <- sort(unique(body_mass_participant$participant_id))
+n_per_page       <- 4
+n_pages          <- ceiling(length(all_participants) / n_per_page)
+
+# Color and shape mapping: Valid = AM, Error = PM or NI
+flag_colors <- c("Valid" = "#2E86AB", "Error" = "#E63946")
+flag_shapes <- c("Valid" = 16,        "Error" = 4)
+
+for (i in seq_len(n_pages)) {
+  start_idx         <- (i - 1) * n_per_page + 1
+  end_idx           <- min(i * n_per_page, length(all_participants))
+  participants_page <- all_participants[start_idx:end_idx]
+
+  body_mass_subset <- body_mass_participant %>%
+    filter(participant_id %in% participants_page) %>%
+    mutate(
+      date_converted   = as.Date(date_converted),
+      # Flag PM and NI as protocol errors (measurement outside morning window)
+      measurement_type = case_when(
+        period %in% c("PM", "NI") ~ "Error",
+        TRUE                       ~ "Valid"
+      ),
+      measurement_type = factor(measurement_type, levels = c("Valid", "Error")),
+      hour_of_day      = hour(unix_time_converted)
+    )
+
+  plot_hour <- ggplot(body_mass_subset,
+                      aes(x = date_converted, y = hour_of_day)) +
+    geom_point(aes(color = measurement_type, shape = measurement_type),
+               size = 2, position = position_jitter(), alpha = 0.85) +
+    scale_color_manual(values = flag_colors, name = "Measurement type") +
+    scale_shape_manual(values = flag_shapes, name = "Measurement type") +
+    scale_y_continuous(breaks = seq(0, 24, by = 4), limits = c(0, 24)) +
+    facet_wrap(~ participant_id, nrow = 2, ncol = 2) +
+    labs(x = "Date of measurement", y = "Hour of measurement (24h)") +
+    theme_minimal() +
+    theme(legend.position= "right",
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+  print(plot_hour)
+}
+
+```
+
+
+## Remove PM and NI measurements
+
+
+```{r filter-am-only}
+# Remove all non-morning measurements (protocol deviations)
+# Only AM measurements are valid per study design
+body_mass_participant <- body_mass_participant %>%
+  filter(period == "AM")
+
+message("Rows retained after AM filter: ", nrow(body_mass_participant))
+```
+
+***
+
+# Step 3 — Flag and remove implausible daily variations {#step3}
+
+A daily change in body mass exceeding 4 kg is considered physiologically
+implausible and is treated as a measurement error.
+
+## Compute daily delta body mass and flag implausible variations
+
+```{r compute-delta-flag}
+# Store data before flagging loop for safe reuse in plotting
+
+body_mass_participant <- body_mass_participant %>%
+  arrange(participant_id, date_converted) %>%
+  group_by(participant_id) %>%
+  mutate(
+    mass_prev      = lag(mass),
+    # Daily change from previous morning measurement
+    delta_bodymass = mass - mass_prev,
+    # Flag variations exceeding 4 kg as implausible
+    flag_4kg       = case_when(
+      is.na(delta_bodymass)   ~ "First measurement",
+      abs(delta_bodymass) > 4 ~ "> 4 kg variation",
+      TRUE                    ~ "Normal variation"
+    ),
+    # Label text for flagged points (e.g., "+5.2 kg")
+    flag_label     = ifelse(
+      abs(delta_bodymass) > 4 & !is.na(delta_bodymass),
+      paste0(ifelse(delta_bodymass > 0, "+", ""), round(delta_bodymass, 1), " kg"),
+      NA
+    )
+  ) %>%
+  ungroup()
+
+# Snapshot AFTER delta is computed — used for before/after QC plots
+body_mass_before_cleaning <- body_mass_participant
+```
+
+## Plot daily body mass variation per participant
+
+```{r plot-delta-bm, echo=FALSE}
+
+all_participants_bm <- sort(unique(body_mass_participant$participant_id))
+n_per_page          <- 4
+n_pages             <- ceiling(length(all_participants_bm) / n_per_page)
+
+
+for (i in seq_len(n_pages)) {
+  start_idx         <- (i - 1) * n_per_page + 1
+  end_idx           <- min(i * n_per_page, length(all_participants_bm))
+  participants_page <- all_participants_bm[start_idx:end_idx]
+
+  
+  plot_data <- body_mass_participant %>%
+    filter(participant_id %in% participants_page)
+
+  plot_bm_var <- ggplot(plot_data, aes(x = date_converted, y = delta_bodymass)) +
+    geom_line(color = "grey70", linewidth = 0.5) +
+    geom_point(aes(color = flag_4kg), size = 2, alpha = 0.85) +
+    geom_text(aes(label = flag_label),
+              na.rm = TRUE, vjust = -1, size = 3, color = "#E63946") +
+    geom_hline(yintercept = 0, linetype = "dashed",
+               color = "grey50", linewidth = 0.4) +
+    scale_color_manual(
+      values = c(
+        "First measurement" = "grey50",
+        "Normal variation"  = "#2E86AB",
+        "> 4 kg variation"  = "#E63946"
+      ),
+      name = "Flag"
+    ) +
+    scale_y_continuous(
+      limits = c(-5, 5),
+      breaks = seq(-5, 5, by = 1),
+      oob    = scales::squish   # Values outside limits are shown at the boundary
+    ) +
+    facet_wrap(~ participant_id, nrow = 2, ncol = 2) +
+    labs(
+      title = paste("Body mass daily change — page", i),
+      x     = "Date",
+      y     = "Daily change in body mass (kg)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "right",
+          axis.text.x     = element_text(angle = 45, hjust = 1, size = 8))
+  print(plot_bm_var)
+}
+```
+
+## Remove implausible variations
+
+```{r remove-implausible-bm}
+# Remove rows where flag_label is not NA (i.e., daily variation > 4 kg)
+# Rows with NA flag_label are either normal variations or first measurements
+
+cleaned_body_mass <- body_mass_participant %>%
+  filter(is.na(flag_label))
+
+n_removed_implausible <- nrow(body_mass_participant) - nrow(cleaned_body_mass)
+message("Rows removed (implausible daily variation > 4 kg): ", n_removed_implausible)
+```
+
+***
+
+# Step 4 — Check and remove duplicate measurements {#step4}
+
+## Initial duplicate check (on cleaned data)
+
+```{r check-duplicates-initial, message=FALSE, warning=FALSE}
+# Check for duplicates in cleaned_body_mass (after AM filter and >4kg removal)
+duplicates_check <- cleaned_body_mass %>%
+  group_by(period, macID, date_converted, participant_id) %>%
+  summarise(duplicate_count = n(), .groups = "drop") %>%
+  filter(duplicate_count > 1)
+
+if (nrow(duplicates_check) > 0) {
+  message("Duplicates found — will resolve using awakening reference time:")
+  print(duplicates_check)
+} else {
+  message("No duplicates found — reference-time selection step not required.")
+}
+```
+
+## Load and prepare sleep data for reference-time matching
+
+For body mass, only the morning (AM) period is relevant. The reference time for AM is the participant's awakening time derived from the sleep analysis.
+
+> **Note:** The sleep processing block below is identical to `blood_pressure.Rmd`. This is intentional — both scripts require the same awakening reference times.
+
+
+
+```{r load-sleep}
+sleep_analysis_raw <- read.csv(
+  file.path(path_dat, "sleep_analysis_daily.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+```{r assign-participant-sleep}
+# Derive local_time from sleepEnd for participant ID matching
+# EDT offset: -14400 seconds (UTC-4, valid for June 2024 Montreal)
+sleep_analysis_raw <- sleep_analysis_raw %>%
+  mutate(
+    local_time = as.Date(
+      as.POSIXct(sleepEnd, origin = "1970-01-01", tz = "UTC") - 14400
+    )
+  )
+
+sleep_analysis_participant <- add_participant_id_watch(
+  sleep_analysis_raw,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+```
+
+
+
+
+```{r filter-sleep, message=FALSE, warning=FALSE}
+# Convert Unix timestamps to local Montreal time and extract date components
+sleep_analysis_participant <- sleep_analysis_participant %>%
+  mutate(
+    sleepStart_time = as.POSIXct(sleepStart, origin = "1970-01-01", tz = "UTC") - 14400,
+    sleepEnd_time   = as.POSIXct(sleepEnd,   origin = "1970-01-01", tz = "UTC") - 14400,
+    date_bedtime    = as.Date(sleepStart_time),
+    date_awakening  = as.Date(sleepEnd_time)
+  ) %>%
+  # Restrict to heatwave monitoring window to reduce data rows
+  filter(
+    (sleepStart_time >= as.POSIXct("2024-06-09 00:00:00") &
+     sleepStart_time <= as.POSIXct("2024-06-29 23:59:59")) |
+    (sleepEnd_time   >= as.POSIXct("2024-06-09 00:00:00") &
+     sleepEnd_time   <= as.POSIXct("2024-06-29 23:59:59"))
+  )
+
+# Retain only physiologically plausible sleep episodes
+sleep_analysis_filter <- sleep_analysis_participant %>%
+  select(participant_id, macID, sleepStart, sleepEnd,
+         sleepStart_time, sleepEnd_time, date_bedtime, date_awakening) %>%
+  filter(
+    format(sleepEnd_time,    "%H:%M") >= "03:00" &
+    format(sleepEnd_time,    "%H:%M") <= "11:59" &
+    (format(sleepStart_time, "%H:%M") >= "18:00" |
+     format(sleepStart_time, "%H:%M") <= "02:59")
+  )
+
+n_sleep_removed <- nrow(sleep_analysis_participant) - nrow(sleep_analysis_filter)
+message("Sleep records retained: ", nrow(sleep_analysis_filter),
+        " | Removed (implausible sleep windows): ", n_sleep_removed)
+```
+
+## Merge body mass and sleep data
+
+```{r merge-bm-sleep}
+# Use date_awakening as the merge key (matches date_converted in body mass data)
+sleep_analysis_filter <- sleep_analysis_filter %>%
+  mutate(date_converted = date_awakening)
+
+# Left join: every body mass record is kept; sleep times added where available
+body_mass_sleep_merged <- cleaned_body_mass %>%
+  left_join(
+    sleep_analysis_filter,
+    by = c("macID", "participant_id", "date_converted")
+  ) %>%
+  select(-tz, -X, -local_time) %>%
+  ungroup()
+```
+
+## Assign reference time and select closest measurement
+```{r set-reference-time}
+# Assigns reference_time per period:
+#   AM → awakening time (sleepEnd_time)
+#   PM → 15:00 (not applicable here — all records are AM)
+#   NI → bedtime (sleepStart_time)
+body_mass_sleep_merged <- set_reference_time(body_mass_sleep_merged)
+```
+
+Once we define reference time, we should refine and adjusted for NI period when values are behind midnight (new day).
+
+```{r number-and-index-duplicates}
+# Number each measurement per group in descending unix order
+# row_num = 1 → most recent measurement; row_num > 1 → older measurements to evaluate
+body_mass_sleep_merged <- body_mass_sleep_merged %>%
+  arrange(macID, period, date_converted, unix) %>%
+  group_by(macID, period, date_converted, participant_id) %>%
+  mutate(row_num = row_number(desc(unix))) %>%
+  ungroup()
+
+# Identify rows belonging to groups with more than one measurement
+indices_row <- which(body_mass_sleep_merged$row_num > 1)
+message("Rows belonging to groups with multiple measurements: ", length(indices_row))
+```
+
+```{r get-surrounding-indices}
+# Retrieve all indices (including row_num = 1) for groups that have duplicates
+# Required by remove_farthest_measure() to compare within-group time differences
+surrounding_indices_list <- get_surrounding_indices(indices_row, body_mass_sleep_merged)
+```
+
+```{r remove-farthest-measurement}
+# Compute absolute time difference from reference_time for each measurement
+body_mass_sleep_merged <- body_mass_sleep_merged %>%
+  group_by(participant_id, date_converted, period) %>%
+  mutate(
+    abs_time_diff = abs(difftime(unix_time_converted, reference_time, units = "secs"))
+  ) %>%
+  ungroup()
+
+# Keep only the measurement closest to the awakening reference time per group
+final_body_mass_data <- remove_farthest_measure(
+  body_mass_sleep_merged,
+  surrounding_indices_list
+)
+
+n_removed_duplicates <- nrow(body_mass_sleep_merged) - nrow(final_body_mass_data)
+message("Rows removed (farthest from reference time): ", n_removed_duplicates)
+```
+
+
+## Final duplicate verification
+
+```{r check-duplicates-final, message=FALSE, warning=FALSE}
+# Confirm no duplicates remain after reference-time selection
+duplicates_final <- final_body_mass_data %>%
+  group_by(period, macID, date_converted, participant_id) %>%
+  summarise(duplicate_count = n(), .groups = "drop") %>%
+  filter(duplicate_count > 1)
+
+if (nrow(duplicates_final) > 0) {
+  message("WARNING: Duplicates still present:")
+  print(duplicates_final)
+} else {
+  message("Final duplicate check passed: one measurement per participant per day.")
+}
+```
+
+***
+
+# Step 5 — Final adjustments and export {#step5}
+
+## Adjust delta body mass for first measurement
+
+The first measurement per participant has no prior day to compare against, so `delta_bodymass` is `NA`. We set it to 0 to indicate no change at baseline.
+
+```{r adjust-first-delta}
+# Replace NA delta_bodymass (first measurement only) with 0
+# This is a deliberate modelling choice: the baseline is treated as zero change
+final_body_mass_data <- final_body_mass_data %>%
+  group_by(participant_id) %>%
+  mutate(delta_bodymass = ifelse(is.na(delta_bodymass), 0, delta_bodymass)) %>%
+  ungroup()
+
+# Convert delta_bodymass from kg to grams for easier interpretation
+final_body_mass_data <- final_body_mass_data %>%
+  mutate(delta_bodymass = delta_bodymass * 1000)
+```
+
+## Remove intermediate processing columns
+
+```{r clean-final-columns}
+# Remove columns used only for QC and intermediate steps
+final_body_mass_data <- final_body_mass_data %>%
+  select(
+    -abs_time_diff, -unix, -id,
+    -sleepStart_time, -sleepEnd_time,
+    -date_bedtime, -date_awakening,
+    -sleepStart, -sleepEnd,
+    -flag_label, -flag_4kg,
+    -reference_time, -row_num, -mass_prev, -local_date, -impedance
+  )
+```
+
+## Export processed dataset
+
+```{r export-final}
+# Export clean body mass dataset to RES/Physiological/
+output_file <- file.path(path_res, "body_mass_processed.csv")
+write.csv(final_body_mass_data, output_file, row.names = FALSE)
+
+```
+
+
+***
+
+# Step 6 — Quality control plots {#step6}
+
+## Before vs. after filtering: delta body mass over time
+```{r plot-timeseries-before-after, echo=FALSE}
+# "Before" = after AM filter and >4kg removal, before deduplication
+# "After"  = final cleaned dataset
+line_bm_bef <- ggplot(body_mass_before_cleaning,
+                      aes(x = date_converted, y = delta_bodymass)) +
+  geom_jitter(alpha = 0.8, size = 0.8, width = 0.2) +
+  labs(title = "Before cleaning (all AM measurements)",
+       x = "", y = "Delta body mass (kg)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+line_bm_aft <- ggplot(final_body_mass_data,
+                      aes(x = date_converted, y = delta_bodymass)) +
+  geom_jitter(alpha = 0.8, size = 0.8, width = 0.2) +
+  labs(title = "After cleaning",
+       x = "", y = "Delta body mass (grams)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+line_bm_bef / line_bm_aft +
+  plot_annotation(title = "Effect of data cleaning on delta body mass over time")
+```
+
+## Before vs. after filtering: distributions
+
+```{r plot-histograms-before-after, echo=FALSE}
+histo_bm_bef <- ggplot(body_mass_before_cleaning, aes(x = delta_bodymass)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 fill = "lightblue", color = "grey", bins = 30) +
+  labs(title = "Before cleaning", x = "Delta body mass (kg)", y = "Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+histo_bm_aft <- ggplot(final_body_mass_data, aes(x = delta_bodymass)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 fill = "lightblue", color = "grey", bins = 30) +
+  labs(title = "After cleaning", x = "Delta body mass (grams)", y = "Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+histo_bm_bef / histo_bm_aft +
+  plot_annotation(title = "Effect of data cleaning on delta body mass distribution")
+```
+
+## Before vs. after filtering: boxplots by period
+
+```{r plot-boxplots-before-after, echo=FALSE}
+bxp_bm_bef <- ggplot(body_mass_before_cleaning,
+                     aes(x = period, y = delta_bodymass)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.2) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1, color = "grey2") +
+  labs(title = "Before cleaning", x = "", y = "Delta body mass (kg)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+bxp_bm_aft <- ggplot(final_body_mass_data,
+                     aes(x = period, y = delta_bodymass)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.2) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1, color = "grey2") +
+  labs(title = "After cleaning", x = "", y = "Delta body mass (grams)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+bxp_bm_bef / bxp_bm_aft +
+  plot_annotation(title = "Effect of data cleaning on delta body mass by period")
+```
+
+***
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

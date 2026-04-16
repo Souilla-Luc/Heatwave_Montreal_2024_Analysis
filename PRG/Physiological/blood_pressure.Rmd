@@ -1,0 +1,732 @@
+---
+title: "Blood Pressure — HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-04"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+
+<!--
+================================================================================
+SCRIPT:  PRG/Physiological/blood_pressure.Rmd
+PURPOSE: Full data preparation pipeline for  blood pressure and heart rate collected via blood pressure monitors by participant during the Montreal heatwave in 2024. This script:
+           1. Assigns participant IDs and study periods to raw BP data
+           2. Flags and removes error and implausible measurements
+           3. Removes duplicate measurements within 5-minute windows
+           4. Merges BP data with sleep analysis (awakening / bedtime)
+           5. Selects one reference measurement per participant per period (AM/PM/NI)
+           6. Computes mean arterial pressure (MAP)
+           7. Exports the clean final dataset and QC plots
+
+INPUT FILES (DAT/):
+  - blood_pressure.csv              → raw smartwatch BP measurements
+  - baseline_long.csv               → participant–macID–date lookup (from Data_preparation.Rmd)
+  - sleep_analysis_daily.csv        → daily sleep start/end times per participant
+
+OUTPUT FILES (RES/Physiological/):
+  - blood_pressure_processed.csv    → cleaned, one-measurement-per-period BP dataset
+
+DEPENDENCIES:
+  - PRG/Functions/functions_participant_period.R   (assign_study_period,
+                            add_participant_id_watch,assign_heatwave)
+  - PRG/Functions/functions_cleaning_data.R        (set_reference_time)
+  - PRG/Functions/functions_adjusted_ref_time. (set_adjusted_night_time)
+
+IMPLAUSIBLE VALUE THRESHOLDS (clinical guidelines):
+  - SBP:  70 – 240 mmHg  (flagging); 75 – 200 mmHg (removal)
+  - DBP:  40 – 150 mmHg  (flagging); 44 – 135 mmHg (removal)
+  - HR:   30 – 220 bpm   (flagging); 40 – 140 bpm  (removal)
+
+TIMEZONE NOTE:
+  All Unix timestamps are stored in UTC. Montreal operates on EDT (UTC-4) during the study period (June 2024).
+
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress package messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script prepares the **blood pressure (BP)** and **heart rate (HR)** dataset collected during the Montreal heatwave 2024.
+It follows the three-step pipeline defined in `Data_preparation.Rmd`:
+
+1. **`blood_pressure_raw`** — raw upload and participant ID assignment
+2. **`blood_pressure_participant`** — error flagging, implausible value removal, deduplication
+3. **`final_blood_pressure_data`** — reference-time selection, MAP computation, export processed data in DAT/ Processed folder
+
+---
+
+# Environment setup
+
+## Load packages
+
+> **Note:** This script can be run standalone. All required packages are loaded here explicitly. If running after `Data_preparation.Rmd` in the same R session,packages are already loaded and this step is skipped automatically.
+
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+required_packages <- c(
+  "here", "dplyr", "tidyr", "lubridate",
+  "ggplot2", "patchwork", "purrr"
+)
+
+install_if_missing <- function(packages) {
+  missing <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing) > 0) install.packages(missing)
+}
+
+install_if_missing(required_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+
+## Set project root and directory paths
+
+```{r set-paths}
+# Anchor here() to the project root from this script's location
+here::i_am("PRG/Physiological/blood_pressure.Rmd")
+
+# Define paths using 'here' to get project-relative paths
+path_dat <- here("DAT")                  # Raw data folder
+path_prg <- here("PRG")                  # Scripts folder
+path_res <- here("DAT/Processed")       # Output folder for data processed
+```
+
+## Source custom functions
+
+All custom functions are loaded upfront for clarity and to allow standalone execution of this script. See each `.R` file in `PRG/Functions/` for full documentation and parameter descriptions.
+
+```{r source-functions}
+source(here("PRG/Functions/functions_participant_period.R"))  # assign_study_period, add_participant_id_watch, assign_heatwave
+source(here("PRG/Functions/functions_cleaning_data.R"))       # set_reference_time
+source(here("PRG/Functions/functions_adjusted_ref_time.R"))   # set_adjusted_night_time
+```
+
+---
+
+# Step 1 — Load raw data and assign participant IDs {#step1}
+
+## Load raw blood pressure data
+
+```{r load-bp-raw}
+# Load raw blood pressure CSV exported from smartwatch platform
+# sep = ";" because the device software exports with semicolon delimiter
+blood_pressure_raw <- read.csv(
+  file.path(path_dat, "blood_pressure.csv"),
+  header = TRUE, sep = ";", quote = "\"'", dec = "."
+)
+```
+
+## Load participant–macID lookup table
+
+```{r load-baseline-long}
+# baseline_long was created by Data_preparation.Rmd
+# It maps each macID + date range to a participant_id
+baseline_long <- read.csv(
+  file.path(path_dat, "baseline_long.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+
+## Assign study period, participant ID, and heatwave status
+
+
+We need to add period, participant ID and dates of heatwave to the blood pressure data table. We will use the function `functions_participant_period.R` script to do so. 
+
+```{r assign-participant-period}
+# Step 1a: Convert unix timestamp and assign period of day (AM / PM / NI)
+blood_pressure_participant <- assign_study_period(blood_pressure_raw, c("unix"))
+
+# Step 1b: Match each row to a participant_id using macID + local_time window
+blood_pressure_participant <- add_participant_id_watch(
+  blood_pressure_participant,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+
+# Step 1c: Assign heatwave status (BEF_HW_June / HW_June / AFT_HW_June)
+# based on Montreal Public Health definitions (see Data_preparation.Rmd)
+blood_pressure_participant <- assign_heatwave(blood_pressure_participant)
+
+# Keep only rows within the heatwave monitoring window
+blood_pressure_participant <- blood_pressure_participant %>%
+  filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June"))
+```
+
+
+---
+
+# Step 2 — Quality control {#step2}
+
+## Flag measurement errors
+
+Device-reported error flags are combined into a single `error_measurement`indicator. The four source flags are: `cuffLoose`, `irregularPulse`, `moved`, and `improperMeasure`.
+
+```{r flag-error-measurement}
+# Create composite error flag: 1 if any device error flag is active
+blood_pressure_participant <- blood_pressure_participant %>%
+  mutate(
+    error_measurement = ifelse(
+      cuffLoose == 1 | irregularPulse == 1 | moved == 1 | improperMeasure == 1,
+      1, 0
+    )
+  )
+
+# Compute and report error counts
+total_n               <- nrow(blood_pressure_participant)
+total_n_error         <- sum(blood_pressure_participant$error_measurement)
+pct_error             <- round((total_n_error / total_n) * 100, 2)
+total_n_cuffLoose     <- sum(blood_pressure_participant$cuffLoose)
+total_n_irregPulse    <- sum(blood_pressure_participant$irregularPulse)
+total_n_moved         <- sum(blood_pressure_participant$moved)
+total_n_improper      <- sum(blood_pressure_participant$improperMeasure)
+
+message("Error measurements: ", total_n_error, " / ", total_n, " (", pct_error, "%)")
+message("  cuffLoose=", total_n_cuffLoose,
+        " | irregularPulse=", total_n_irregPulse,
+        " | moved=", total_n_moved,
+        " | improperMeasure=", total_n_improper)
+```
+
+## Flag implausible values
+
+Implausible values are flagged based on clinical thresholds.
+Note: a fixed value of 255 mmHg appears in SBP, DBP, and HR when the monitor first connects to the smartwatch — this is a known device artefact.
+
+Flagging thresholds:
+
+| Variable | Lower | Upper |
+|---|---|---|
+| SBP | < 70 mmHg | > 240 mmHg |
+| DBP | < 40 mmHg | > 150 mmHg |
+| HR  | < 30 bpm  | > 220 bpm  |
+
+
+```{r flag-implausible-values}
+blood_pressure_participant <- blood_pressure_participant %>%
+  mutate(
+    implausible_systolic    = ifelse(sbp < 70  | sbp > 240, 1, 0),
+    implausible_diastolic   = ifelse(dbp < 40  | dbp > 150, 1, 0),
+    implausible_hr          = ifelse(hr  < 30  | hr  > 220, 1, 0),
+    implausible_measurement = ifelse(
+      implausible_systolic == 1 | implausible_diastolic == 1 | implausible_hr == 1,
+      1, 0
+    )
+  )
+
+total_n_implausible <- sum(blood_pressure_participant$implausible_measurement)
+pct_implausible     <- round((total_n_implausible / total_n) * 100, 2)
+message("Implausible measurements: ", total_n_implausible, " / ", total_n,
+        " (", pct_implausible, "%)")
+```
+
+## Plot distributions before filtering
+
+Visualize SBP, DBP, and HR over time, color-coded by measurement type
+(Valid / Implausible / Error), to visually confirm the flagging before removal.
+
+
+```{r plot-before-filtering}
+# Prepare plotting dataset with combined measurement type factor
+bp_data_before <- blood_pressure_participant %>%
+  mutate(
+    measurement_type = case_when(
+      error_measurement       == 1 ~ "Error",
+      implausible_measurement == 1 ~ "Implausible",
+      TRUE                         ~ "Valid"
+    ),
+    measurement_type = factor(measurement_type, levels = c("Valid", "Implausible", "Error")),
+    hour_of_day = hour(unix_time_converted)
+  )
+
+# Color and shape mapping for measurement quality
+flag_colors <- c("Valid" = "#2E86AB", "Implausible" = "#F6AE2D", "Error" = "#E63946")
+flag_shapes <- c("Valid" = 16,        "Implausible" = 17,        "Error" = 4)
+
+# SBP over time
+line_sbp_complete_bef <- ggplot(bp_data_before, aes(x = date_converted, y = sbp)) +
+  geom_jitter(aes(color = measurement_type, shape = measurement_type),
+              size = 0.8, alpha = 0.85, width = 0.2, height = 0) +
+  scale_color_manual(values = flag_colors, name = "Type") +
+  scale_shape_manual(values = flag_shapes, name = "Type") +
+  labs(title = "Before filtering", x = "Date of measurement", y = "Systolic BP (mmHg)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+print(line_sbp_complete_bef)
+
+# DBP over time
+line_dbp_complete_bef <- ggplot(bp_data_before, aes(x = date_converted, y = dbp)) +
+  geom_jitter(aes(color = measurement_type, shape = measurement_type),
+              size = 0.8, alpha = 0.85, width = 0.2, height = 0) +
+  scale_color_manual(values = flag_colors, name = "Type") +
+  scale_shape_manual(values = flag_shapes, name = "Type") +
+  labs(title = "Before filtering", x = "Date of measurement", y = "Diastolic BP (mmHg)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+print(line_dbp_complete_bef)
+
+# HR over time
+line_hr_complete_bef <- ggplot(bp_data_before, aes(x = date_converted, y = hr)) +
+  geom_jitter(aes(color = measurement_type, shape = measurement_type),
+              size = 0.8, alpha = 0.85, width = 0.2, height = 0) +
+  scale_color_manual(values = flag_colors, name = "Type") +
+  scale_shape_manual(values = flag_shapes, name = "Type") +
+  labs(title = "Before filtering", x = "Date of measurement", y = "Heart rate (bpm)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+print(line_hr_complete_bef)
+```
+
+## Remove flagged values
+
+Visual inspection confirms that most irregular pulse flags fall within plausible ranges and are retained. 
+
+| Variable | Removal threshold |
+|---|---|
+| SBP | < 75 or > 200 mmHg |
+| DBP | < 44 or > 135 mmHg |
+| HR  | < 40 or > 140 bpm  |
+
+```{r remove-outliers}
+cleaned_bp_data <- blood_pressure_participant %>%
+  arrange(macID, period, date_converted, unix) %>%
+  group_by(macID, period, date_converted) %>%
+  filter(
+    sbp >= 75  & sbp <= 200,   # Refined SBP removal bounds
+    dbp >= 44  & dbp <= 135,   # Refined DBP removal bounds
+    hr  >= 40  & hr  <= 140    # Refined HR removal bounds
+  ) %>%
+  ungroup()
+
+n_removed_outliers <- nrow(blood_pressure_participant) - nrow(cleaned_bp_data)
+message("Rows removed (outliers / error measurements): ", n_removed_outliers)
+```
+
+## Remove duplicate measurements within 5-minute windows
+
+Participants could press the measurement button multiple times in quick succession.
+We group consecutive measurements within a 300-second (5-minute) window and keep only the **last** measurement in each group, as it best reflects the participant's settled resting state after device placement.
+```{r remove-rapid-duplicates}
+ cleaned_bp_data <- cleaned_bp_data %>%
+  arrange(macID, period, date_converted, unix) %>%
+  group_by(macID, period, date_converted) %>%
+  mutate(
+    # Time elapsed since the previous measurement (seconds)
+    time_diff = unix - lag(unix, default = first(unix)),
+    # Increment group counter each time a gap >= 300 seconds occurs
+    group_row = cumsum(is.na(time_diff) | time_diff >= 300)
+  ) %>%
+  group_by(macID, period, date_converted, group_row) %>%
+  # Within each 5-minute window, keep only the last (most settled) measurement
+  slice_tail(n = 1) %>%
+  ungroup()
+
+n_removed_dupl <- nrow(blood_pressure_participant) -
+                  nrow(cleaned_bp_data) - n_removed_outliers
+message("Additional rows removed (rapid duplicates within 5-min window): ",
+        n_removed_dupl)
+```
+
+---
+
+# Step 3 — Merge with sleep data for reference-time selection {#step3}
+
+After deduplication, some participants still have multiple measurements per period per day (e.g., two morning readings on the same date). We resolve thisby selecting the measurement **closest to a physiologically meaningful reference time**:
+
+- **AM (morning):** closest to awakening time (from sleep analysis)
+- **PM (afternoon):** closest to 15:00 (3 PM)
+- **NI (night):** closest to bedtime (from sleep analysis)
+
+## Load and prepare sleep analysis data
+
+```{r load-sleep}
+# Load daily sleep analysis exported from smartwatch platform
+sleep_analysis_raw <- read.csv(
+  file.path(path_dat, "sleep_analysis_daily.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+First, we will load the the file sleep analysis from folder "DAT" to get awakening time and bedtime.
+```{r Sleep-upload}
+file_path_baseline<-file.path(path_dat,"sleep_analysis_daily.csv") #Charging file in DAT folder, make sure the name of the file mathcing with this one
+sleep_analysis_raw<- read.csv(file_path_baseline, header = TRUE, sep = ",", quote = "\"'", dec = ".")
+```
+
+## Assign participant ID to sleep data
+
+The sleep data contains unix timestamps but no `local_time` column. We derived `local_time` from `sleepEnd` (awakening time) using the EDT offset (-14400 s = UTC-4).
+
+```{r assign-participant-sleep}
+# Create local_time from sleepEnd unix timestamp for participant ID matching
+sleep_analysis_raw <- sleep_analysis_raw %>%
+  mutate(
+    local_time = as.Date(
+      as.POSIXct(sleepEnd, origin = "1970-01-01", tz = "UTC") - 14400  # EDT offset
+    )
+  )
+
+# Match each sleep record to a participant_id using macID + local_time
+sleep_analysis_participant <- add_participant_id_watch(
+  sleep_analysis_raw,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+```
+
+## Filter sleep data to study period and valid sleep windows
+
+```{r filter-sleep}
+# Step 1: Convert Unix timestamps to POSIXct and extract date components
+sleep_analysis_participant <- sleep_analysis_participant %>%
+  mutate(
+    # Apply EDT offset (-14400 s) to convert UTC unix to local Montreal time
+    sleepStart_time = as.POSIXct(sleepStart, origin = "1970-01-01", tz = "UTC") - 14400,
+    sleepEnd_time   = as.POSIXct(sleepEnd,   origin = "1970-01-01", tz = "UTC") - 14400,
+    date_bedtime    = as.Date(sleepStart_time),
+    date_awakening  = as.Date(sleepEnd_time)
+  ) %>%
+  # Restrict to the heatwave monitoring window (June 9–29, 2024)
+  filter(
+    (sleepStart_time >= as.POSIXct("2024-06-09 00:00:00") &
+     sleepStart_time <= as.POSIXct("2024-06-29 23:59:59")) |
+    (sleepEnd_time   >= as.POSIXct("2024-06-09 00:00:00") &
+     sleepEnd_time   <= as.POSIXct("2024-06-29 23:59:59"))
+  )
+
+# Step 2: Retain only physiologically plausible sleep episodes:
+#   - Awakening (sleepEnd) between 03:00 and 11:59 AM
+#   - Bedtime (sleepStart) between 18:00 and 02:59 (same or next day)
+sleep_analysis_filter <- sleep_analysis_participant %>%
+  select(participant_id, macID, sleepStart, sleepEnd,
+         sleepStart_time, sleepEnd_time, date_bedtime, date_awakening) %>%
+  filter(
+    format(sleepEnd_time,   "%H:%M") >= "03:00" &
+    format(sleepEnd_time,   "%H:%M") <= "11:59" &
+    (format(sleepStart_time, "%H:%M") >= "18:00" |
+     format(sleepStart_time, "%H:%M") <= "02:59")
+  )
+
+n_sleep_removed <- nrow(sleep_analysis_participant) - nrow(sleep_analysis_filter)
+message("Sleep records retained: ", nrow(sleep_analysis_filter),
+        " | Removed (implausible sleep windows): ", n_sleep_removed)
+```
+
+
+## Merge blood pressure and sleep data
+
+```{r merge-bp-sleep}
+# Align date keys: use date_awakening as the merge date (matches date_converted in BP data)
+sleep_analysis_filter <- sleep_analysis_filter %>%
+  mutate(date_converted = date_awakening)
+
+# Left join: every BP record is kept; sleep times added where available
+bp_sleep_merged <- cleaned_bp_data %>%
+  left_join(
+    sleep_analysis_filter,
+    by = c("macID", "participant_id", "date_converted")
+  )
+
+# Remove columns used only for QC flagging and intermediate processing
+bp_sleep_merged <- bp_sleep_merged %>%
+  select(
+    -moved, -cuffLoose, -irregularPulse, -improperMeasure,
+    -implausible_systolic, -implausible_diastolic, -implausible_hr,
+    -implausible_measurement, -error_measurement,
+    -tz, -X, -local_time
+  )
+```
+
+
+---
+
+# Step 4 — Assign reference times and select closest measurement {#step4}
+
+## Set reference time per period
+```{r set-reference-time}
+# Assigns reference_time column based on period:
+#   AM  → sleepEnd_time (awakening)
+#   PM  → 15:00 on date_converted
+#   NI  → sleepStart_time (bedtime)
+# See PRG/Functions/functions_cleaning_data.R for full details
+bp_sleep_merged <- set_reference_time(bp_sleep_merged)
+```
+
+## Adjust night reference time for post-midnight measurements
+
+Some NI measurements are recorded after midnight (next calendar day).
+`set_adjusted_night_time()` corrects the reference time for these cases.
+```{r adjust-night-reference-time}
+# Adjusts reference_time for NI period when measurement falls past midnight
+# See PRG/Functions/functions_adjusted_ref_time.R for full details
+bp_sleep_merged <- set_adjusted_night_time(bp_sleep_merged)
+```
+
+## Verify night reference time adjustment
+```{r verify-night-reference-time}
+# Compute time difference (in minutes) between NI measurements and adjusted bedtime
+bp_night_verif <- bp_sleep_merged %>%
+  filter(period == "NI") %>%
+  mutate(
+    time_diff_minutes = as.numeric(
+      difftime(unix_time_converted, adjusted_reference_time, units = "mins")
+    )
+  )
+
+time_diff_summary <- bp_night_verif %>%
+  summarise(
+    mean_diff = mean(time_diff_minutes, na.rm = TRUE),
+    sd_diff   = sd(time_diff_minutes,   na.rm = TRUE),
+    min_diff  = min(time_diff_minutes,  na.rm = TRUE),
+    max_diff  = max(time_diff_minutes,  na.rm = TRUE)
+  )
+
+message(
+  "NI period — time between measurement and adjusted bedtime (minutes):",
+  "\n  Mean = ", round(time_diff_summary$mean_diff, 2),
+  " | SD = ",   round(time_diff_summary$sd_diff,   2),
+  " | Min = ",  round(time_diff_summary$min_diff,  2),
+  " | Max = ",  round(time_diff_summary$max_diff,  2)
+)
+```
+
+## Select one measurement per participant per period
+
+When multiple measurements remain for the same participant, date, and period, we retain the one with the **smallest absolute time difference** from the reference time.
+
+For example: three morning readings at 08:45, 09:15, and 10:15 with awakening
+at 08:30 → the 08:45 reading is kept.
+
+
+```{r select-reference-measurement, include=FALSE}
+# Number each measurement per group in DESCENDING unix order
+# row_num = 1 → most recent measurement in the group
+#create row_num which numbered the measurement per period per participant 
+bp_sleep_merged <- bp_sleep_merged %>%
+  arrange(macID, period, date_converted, unix) %>%
+  group_by(macID, period, date_converted, participant_id) %>%
+  mutate(row_num = row_number(desc(unix))) %>%
+  ungroup()
+
+# Compute absolute time difference from reference_time for each measurement
+bp_sleep_merged <- bp_sleep_merged %>%
+  group_by(participant_id, date_converted, period) %>%
+  mutate(
+    abs_time_diff = abs(difftime(unix_time_converted, reference_time, units = "secs"))
+  ) %>%
+  ungroup()
+
+# Identify indices of rows where more than one measurement exists per group
+indices_row <- which(bp_sleep_merged$row_num > 1)
+message("Groups with more than one measurement: ", length(indices_row), " rows")
+
+# Retrieve surrounding indices and remove the farthest measurement per group
+surrounding_indices_list <- get_surrounding_indices(indices_row, bp_sleep_merged)
+final_blood_pressure_data <- remove_farthest_measure(bp_sleep_merged, surrounding_indices_list)
+```
+
+---
+
+# Step 5 — Final dataset: compute MAP and export {#step5}
+
+## Check for remaining duplicates
+
+```{r check-duplicates,  message=FALSE, warning=FALSE}
+
+# Verify that no participant has more than one measurement per period per date
+duplicates_check <- final_blood_pressure_data %>%
+  group_by(period, macID, date_converted) %>%
+  summarise(duplicate_count = n(), .groups = "drop") %>%
+  filter(duplicate_count > 1)
+
+if (nrow(duplicates_check) > 0) {
+  message("WARNING: Duplicates remain for the following groups:")
+  print(duplicates_check)
+} else {
+  message("Duplicate check passed: one measurement per participant per period per date.")
+}
+
+```
+
+## Compute mean arterial pressure and clean final columns
+
+```{r finalize-dataset}
+# Compute MAP using the standard clinical formula: MAP = 1/3 SBP + 2/3 DBP
+# Remove intermediate processing columns not needed for analysis
+final_blood_pressure_data <- final_blood_pressure_data %>%
+  mutate(
+    map = round((1/3 * sbp + 2/3 * dbp), 1)   # Mean arterial pressure (mmHg)
+  ) %>%
+  select(
+    -row_num, -abs_time_diff,
+    -unix, -id,
+    -sleepStart_time, -sleepEnd_time,
+    -date_bedtime, -date_awakening,
+    -sleepStart, -sleepEnd,
+    -hours_discrepancy, -adjusted_reference_time, -local_date, -time_diff, -time_diff_minutes, -group_row, -reference_time
+  )
+```
+
+## Export processed dataset
+```{r export-final}
+# Export clean dataset to RES/Physiological/ for use in statistical analysis
+output_file <- file.path(path_res, "blood_pressure_processed.csv")
+write.csv(final_blood_pressure_data, output_file, row.names = FALSE)
+```
+
+---
+
+# Step 6 — Quality control plots after filtering {#step6}
+
+## Time series: SBP, DBP, HR by period of day
+
+
+```{r plot-timeseries-after, echo=FALSE}
+line_sbp_aft <- ggplot(final_blood_pressure_data, aes(x = date_converted, y = sbp, color = period)) +
+  geom_jitter(alpha = 0.8, size = 0.8, width = 0.2) +
+  labs(title = "After filtering", x = "", y = "Systolic BP (mmHg)", color = "Period of day") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+print(line_sbp_aft)
+
+line_dbp_aft <- ggplot(final_blood_pressure_data, aes(x = date_converted, y = dbp, color = period)) +
+  geom_jitter(alpha = 0.8, size = 0.8, width = 0.2) +
+  labs(title = "After filtering", x = "", y = "Diastolic BP (mmHg)", color = "Period of day") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+print(line_dbp_aft)
+
+line_hr_aft <- ggplot(final_blood_pressure_data, aes(x = date_converted, y = hr, color = period)) +
+  geom_jitter(alpha = 0.8, size = 0.8, width = 0.2) +
+  labs(title = "After filtering", x = "Date of measurement", y = "Heart rate (bpm)", color = "Period of day") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+print(line_hr_aft)
+```
+
+## Histograms: distributions after filtering
+
+```{r plot-histograms-after, echo=FALSE}
+histo_sbp_aft <- ggplot(final_blood_pressure_data, aes(x = sbp)) +
+  geom_histogram(aes(y = after_stat(density)), fill = "lightblue", color = "grey", bins = 30) +
+  labs(title = "After filtering", x = "Systolic blood pressure (mmHg)", y = "Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(histo_sbp_aft)
+
+histo_dbp_aft <- ggplot(final_blood_pressure_data, aes(x = dbp)) +
+  geom_histogram(aes(y = after_stat(density)), fill = "lightblue", color = "grey", bins = 30) +
+  labs(title = "After filtering", x = "Diastolic blood pressure (mmHg)", y = "Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(histo_dbp_aft)
+
+histo_hr_aft <- ggplot(final_blood_pressure_data, aes(x = hr)) +
+  geom_histogram(aes(y = after_stat(density)), fill = "lightblue", color = "grey", bins = 30) +
+  labs(title = "After filtering", x = "Heart rate (bpm)", y = "Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(histo_hr_aft)
+```
+
+## Boxplots by period of day
+```{r plot-boxplots-after, echo=FALSE}
+bxp_sbp_aft <- ggplot(final_blood_pressure_data, aes(x = period, y = sbp, fill = period)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1, color = "grey2") +
+  coord_cartesian(ylim = c(60, 200)) +
+  labs(title = "After filtering", x = "", y = "Systolic BP (mmHg)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+print(bxp_sbp_aft)
+
+bxp_dbp_aft <- ggplot(final_blood_pressure_data, aes(x = period, y = dbp, fill = period)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1, color = "grey2") +
+  coord_cartesian(ylim = c(30, 155)) +
+  labs(title = "After filtering", x = "", y = "Diastolic BP (mmHg)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+print(bxp_dbp_aft)
+
+bxp_hr_aft <- ggplot(final_blood_pressure_data, aes(x = period, y = hr, fill = period)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1, color = "grey2") +
+  coord_cartesian(ylim = c(30, 200)) +
+  labs(title = "After filtering", x = "", y = "Heart rate (bpm)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+print(bxp_hr_aft)
+```
+
+
+## Heatmap: measurement count per participant per period per day
+
+Used to verify that the deduplication pipeline achieved one measurement per
+participant per period per date across all participants.
+```{r plot-heatmap-individual, echo=FALSE}
+all_participants <- sort(unique(final_blood_pressure_data$participant_id))
+n_per_page       <- 4   # Display 4 participants per page (2×2 grid)
+n_pages          <- ceiling(length(all_participants) / n_per_page)
+
+# Store original data before loop to prevent accidental overwrite
+original_data <- final_blood_pressure_data
+
+for (i in seq_len(n_pages)) {
+  start_idx          <- (i - 1) * n_per_page + 1
+  end_idx            <- min(i * n_per_page, length(all_participants))
+  participants_page  <- all_participants[start_idx:end_idx]
+
+  # Use a temporary object — never overwrite the original data inside a loop
+  plot_data <- original_data %>%
+    filter(participant_id %in% participants_page) %>%
+    group_by(participant_id, date_converted, period) %>%
+    summarise(n_measurements = n(), .groups = "drop")
+
+  heatmap_indiv <- ggplot(plot_data, aes(x = date_converted, y = period, fill = n_measurements)) +
+    geom_tile(color = "grey") +
+    scale_fill_gradient(low = "lightblue", high = "darkblue", name = "N measurements") +
+    facet_wrap(~ participant_id, nrow = 2, ncol = 2) +
+    labs(title = "BP measurements per period per day", x = "", y = "Period") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  print(heatmap_indiv)
+}
+```
+
+## Before vs. after filtering comparison
+
+```{r plot-before-after-comparison, echo=FALSE}
+line_sbp_complete_bef / line_sbp_aft +
+  plot_annotation(title = "Effect of data cleaning on systolic BP")
+
+line_dbp_complete_bef / line_dbp_aft +
+  plot_annotation(title = "Effect of data cleaning on diastolic BP")
+
+line_hr_complete_bef / line_hr_aft +
+  plot_annotation(title = "Effect of data cleaning on heart rate")
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

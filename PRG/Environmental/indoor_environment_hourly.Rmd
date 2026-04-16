@@ -1,0 +1,545 @@
+---
+title: "indoor_environment"
+author: "Souilla Luc"
+date: "2026-03-04"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+<!--
+================================================================================
+SCRIPT:  PRG/Environmental/indoor_environment_hourly.Rmd
+PURPOSE: Data preparation pipeline for indoor environmental data (temperature and relative humidity) collected at minute resolution via environmental nodes during the Montreal heatwave 2024. This script:
+           1. Assigns participant IDs using baseline_nodes lookup
+           2. Assigns heatwave status and filters to study window
+           3. Aggregates minute-level data to hourly means
+           4. Flags and removes implausible values (visual then definitive)
+           5. Applies participant-specific correction for node malfunction
+           6. Re-aggregates on cleaned data
+           7. Summarizes data completeness per participant
+           8. Exports the clean hourly dataset
+
+INPUT FILES (DAT/):
+  - environmental_minute.csv        -> raw minute-level indoor sensor data
+  - baseline_nodes.csv              -> participant-nodeID-date lookup (from Data_preparation.Rmd)
+
+OUTPUT FILES (DAT/Processed/):
+  - indoor_environment_hourly_processed.csv -> cleaned hourly indoor data
+
+SENSOR NOTE:
+  Indoor temperature and relative humidity are derived primarily from the BME680 sensor, which was present in all nodes. A subset of nodes also included either a SHT41 or SHT85 sensor. Due to data quality issues encountered with the SHT41 and SHT85 sensors across participants, the BME680 was retained as the primary sensor for all analyses. SHT41/SHT85 readings are preserved in the dataset as secondary variables for reference.
+
+IMPLAUSIBLE VALUE THRESHOLDS:
+  Visual flagging (for inspection only, not removal):
+    temp_mean < 10 or > 34 deg C  -- used to identify anomalous episodes rh_mean   < 5  or > 90 %
+
+  Definitive removal (applied to raw minute data before re-aggregation):
+    sensors.BME680.temp < 10 or > 50 deg C
+    sensors.BME680.rh   < 5  or > 90 %
+
+The two-threshold approach is intentional: the tighter visual flag (> 34) was used to identify P19's node malfunction episode (see P19 NOTE below), while the definitive removal threshold (> 50) is the physiologically implausible bound applied uniformly across all participants.
+
+P19 NODE MALFUNCTION NOTE:
+Participant P19's environmental node experienced a malfunction episode during which relative humidity readings exceeded 90% (abnormally high), accompanied by simultaneous anomalous temperature readings fixed at ~34.6. Visual inspection confirmed these were sensor artefacts, not real environmental conditions. Both temp and rh values are set to NA for all minutes where P19's rh >= 90%, removing the entire malfunction episode.
+
+HEATWAVE PERIODS (consistent with assign_heatwave()):
+  Before heatwave : 2024-06-11 to 2024-06-17
+  During heatwave : 2024-06-18 to 2024-06-20
+  After heatwave  : 2024-06-21 to 2024-06-27
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script prepares the **indoor environment** dataset from minute-level temperature and relative humidity measurements collected via environmental nodes placed in participants' homes during the Montreal Summer 2024 heatwave study.
+
+Data from the BME680 sensor is used as the primary source for all participants.
+Minute-level data is first aggregated to hourly means for visual quality inspection, then cleaned at the raw minute level before final re-aggregation.
+
+---
+
+# Environment setup
+
+## Load packages
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+required_packages <- c(
+  "here", "dplyr", "tidyr", "lubridate",
+  "ggplot2", "patchwork", "viridis", "openxlsx"
+)
+
+install_if_missing <- function(packages) {
+  missing <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing) > 0) install.packages(missing)
+}
+
+install_if_missing(required_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+## Set project root and directory paths
+
+```{r set-paths}
+here::i_am("PRG/Environmental/indoor_environment_hourly.Rmd")
+
+path_dat <- here("DAT")           # Raw data folder
+path_prg <- here("PRG")           # Scripts folder
+path_res <- here("DAT/Processed") # Output folder for processed data
+```
+
+## Source custom functions
+
+```{r source-functions}
+source(here("PRG/Functions/functions_participant_period.R"))
+```
+
+---
+
+# Step 1 - Load raw data and assign participant IDs {#step1}
+
+## Load raw minute-level indoor environment data
+
+```{r IndEnvH-upload}
+# Load raw minute-level indoor sensor data
+# local_time is created by assign_study_period() from the unix column
+indoor_environment_raw <- read.csv(
+  file.path(path_dat, "environmental_minute.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Load node-participant lookup table
+```{r load-baseline-nodes}
+# baseline_nodes maps each node macID + date range to a participant_id
+# Uses environmental nodes (not smartwatch bangles)
+# Created by Data_preparation.Rmd -- must be run first
+baseline_nodes <- read.csv(
+  file.path(path_dat, "baseline_nodes.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+## Assign study period and participant ID
+```{r IndEnvH-assign-participant}
+# Step 1a: assign_study_period() creates local_time and period columns
+# from the unix timestamp in the raw data
+indoor_environment_participant <- assign_study_period(
+  indoor_environment_raw, c("unix")
+)
+
+# Step 1b: Match each row to a participant_id using node macID + local_time
+# Note: baseline_nodes is used here (not baseline_long) because indoor
+# nodes have separate macIDs from smartwatches
+indoor_environment_participant <- add_participant_id_watch(
+  indoor_environment_participant,
+  baseline_nodes,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+```
+
+## Assign heatwave status and filter to study window
+
+```{r IndEnvH-assign-heatwave}
+# Assign heatwave status using standard function
+indoor_environment_participant <- assign_heatwave(
+  indoor_environment_participant
+)
+
+indoor_environment_participant <- indoor_environment_participant %>%
+  filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June"))
+
+message("Minute-level records after heatwave filter: ",
+        nrow(indoor_environment_participant))
+```
+
+---
+
+# Step 2 - Initial hourly aggregation for QC {#step2}
+
+Raw minute-level data is aggregated to hourly means for visual quality inspection. This is a preliminary aggregation on uncleaned data — a second aggregation on cleaned data is performed in Step 5.
+
+```{r IndEnvH-aggregate-hourly-raw}
+# Create hour-floor timestamp for grouping
+indoor_environment_participant <- indoor_environment_participant %>%
+  mutate(
+    hour_floor = floor_date(as.POSIXct(local_time), unit = "hour")
+  )
+
+# Aggregate to hourly means using BME680 
+indoor_environment_hourly_raw <- indoor_environment_participant %>%
+  group_by(participant_id, hour_floor, date_converted, period, heatwave_status) %>%
+  summarise(
+    temp_mean    = mean(sensors.BME680.temp, na.rm = TRUE),
+    temp_min     = min(sensors.BME680.temp,  na.rm = TRUE),
+    temp_max     = max(sensors.BME680.temp,  na.rm = TRUE),
+    temp_sd      = sd(sensors.BME680.temp,   na.rm = TRUE),
+    rh_mean      = mean(sensors.BME680.rh,   na.rm = TRUE),
+    rh_min       = min(sensors.BME680.rh,    na.rm = TRUE),
+    rh_max       = max(sensors.BME680.rh,    na.rm = TRUE),
+    rh_sd        = sd(sensors.BME680.rh,     na.rm = TRUE),
+    n_obs        = n(),
+    n_temp_valid = sum(!is.na(sensors.BME680.temp)),
+    .groups = "drop"
+  ) %>%
+  # Replace Inf values produced by min/max on all-NA groups with NA
+  mutate(
+    across(c(temp_min, temp_max, rh_min, rh_max),
+           ~ ifelse(is.infinite(.), NA, .))
+  )
+
+message("Hourly records (raw): ", nrow(indoor_environment_hourly_raw))
+```
+
+---
+
+# Step 3 - Coverage heatmap {#step3}
+
+Visualize the number of valid hourly measurements per participant per day to identify missing days or node failures.
+
+```{r IndEnvH-coverage-heatmap, echo=FALSE}
+all_participants <- sort(unique(indoor_environment_hourly_raw$participant_id))
+n_per_page       <- 4
+n_pages          <- ceiling(length(all_participants) / n_per_page)
+
+for (i in seq_len(n_pages)) {
+  start_idx         <- (i - 1) * n_per_page + 1
+  end_idx           <- min(i * n_per_page, length(all_participants))
+  participants_page <- all_participants[start_idx:end_idx]
+
+  hourly_subset <- indoor_environment_hourly_raw %>%
+    filter(participant_id %in% participants_page)
+
+  indoor_env_summary <- hourly_subset %>%
+    group_by(participant_id, date_converted) %>%
+    summarise(
+      n_hours_valid = sum(!is.na(temp_mean)),
+      .groups = "drop"
+    )
+
+  heatmap_indiv_day <- ggplot(
+    indoor_env_summary,
+    aes(x = date_converted, y = "", fill = n_hours_valid)
+  ) +
+    geom_tile(color = "grey") +
+    geom_text(aes(label = ifelse(n_hours_valid == 0, "X", n_hours_valid)),
+              size = 3, color = "white") +
+    scale_fill_gradient(
+      low    = "lightblue", high = "darkblue",
+      limits = c(0, 24), breaks = c(0, 6, 12, 18, 24),
+      name   = "Valid hours\nper day"
+    ) +
+    facet_wrap(~ participant_id, nrow = 2, ncol = 2) +
+    labs(title = "Indoor environment -- valid hourly measurements per day",
+         x = NULL, y = NULL) +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          axis.text.x     = element_text(angle = 45, hjust = 1))
+  print(heatmap_indiv_day)
+}
+```
+
+---
+
+# Step 4 - Visual flagging and QC plots {#step4}
+
+## Flag implausible values for visual inspection
+
+Two flagging thresholds are applied for visual inspection only:
+
+- `temp_mean` < 10 or > 34 deg C
+- `rh_mean` < 5 or > 90 %
+
+The tighter upper temperature bound (34 deg C) was used specifically to identify P19's node malfunction episode during visual inspection. The definitive removal threshold applied in Step 5 is the physiologically implausible bound of 50 deg C — see header block for full rationale.
+
+
+```{r IndEnvH-flag-visual}
+indoor_env_data_subset_raw <- indoor_environment_hourly_raw %>%
+  mutate(
+    measurement_type = case_when(
+      !is.na(temp_mean) & (temp_mean < 10 | temp_mean > 34) ~ "temp_flag",
+      !is.na(rh_mean)   & (rh_mean   < 5  | rh_mean   > 90) ~ "rh_flag",
+      TRUE                                                    ~ "Valid"
+    ),
+    measurement_type = factor(measurement_type,
+                               levels = c("Valid", "temp_flag", "rh_flag"))
+  )
+
+flag_colors <- c("Valid"     = "#2E86AB",
+                 "temp_flag" = "#F6AE2D",
+                 "rh_flag"   = "#E63946")
+flag_shapes <- c("Valid"     = 16,
+                 "temp_flag" = 17,
+                 "rh_flag"   = 4)
+```
+
+## Diagnostic summary of flagged values per participant
+
+```{r IndEnvH-flag-summary}
+# Add numeric flags for diagnostic summary
+indoor_environment_hourly_raw <- indoor_environment_hourly_raw %>%
+  mutate(
+    temp_flag = case_when(
+      is.na(temp_mean)                     ~ NA_real_,
+      temp_mean < 10 | temp_mean > 34      ~ 1,
+      TRUE                                 ~ 0
+    ),
+    rh_flag = case_when(
+      is.na(rh_mean)                       ~ NA_real_,
+      rh_mean < 5 | rh_mean > 90          ~ 1,
+      TRUE                                 ~ 0
+    )
+  )
+
+# Per-participant summary of flagged hours
+indoor_environment_hourly_raw %>%
+  group_by(participant_id) %>%
+  summarise(
+    n_temp_flagged = sum(temp_flag == 1, na.rm = TRUE),
+    n_rh_flagged   = sum(rh_flag   == 1, na.rm = TRUE),
+    n_both_flagged = sum(temp_flag == 1 & rh_flag == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_temp_flagged > 0 | n_rh_flagged > 0) %>%
+  arrange(desc(n_both_flagged))
+```
+
+
+## Before filtering plots
+
+```{r IndEnvH-plot-before, echo=FALSE}
+line_temp_pooled_flagged <- ggplot(
+  indoor_env_data_subset_raw,
+  aes(x = hour_floor, y = temp_mean)
+) +
+  geom_point(aes(color = measurement_type, shape = measurement_type),
+             size = 1, alpha = 0.85) +
+  scale_color_manual(values = flag_colors, name = "Type") +
+  scale_shape_manual(values = flag_shapes, name = "Type") +
+  labs(title = "Before filtering",
+       x = "", y = "Average indoor temperature (deg C)") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text.x     = element_text(angle = 45, hjust = 1, size = 10))
+
+line_rh_pooled_flagged <- ggplot(
+  indoor_env_data_subset_raw,
+  aes(x = hour_floor, y = rh_mean)
+) +
+  geom_point(aes(color = measurement_type, shape = measurement_type),
+             size = 1, alpha = 0.85) +
+  scale_color_manual(values = flag_colors, name = "Type") +
+  scale_shape_manual(values = flag_shapes, name = "Type") +
+  labs(title = "Before filtering",
+       x = "", y = "Average indoor relative humidity (%)") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text.x     = element_text(angle = 45, hjust = 1, size = 10))
+
+print(line_temp_pooled_flagged)
+print(line_rh_pooled_flagged)
+```
+
+---
+
+# Step 5 - Clean raw minute data and re-aggregate {#step5}
+
+Following visual inspection, implausible values are removed at the **raw minute level** before re-aggregation. This approach is more conservative than removing at the hourly level because it prevents a single invalid minute from contaminating an otherwise valid hourly mean.
+
+Definitive removal thresholds:
+
+| Variable | Lower | Upper |
+|---|---|---|
+| sensors.BME680.temp | < 10 deg C | > 50 deg C |
+| sensors.BME680.rh   | < 5 %      | > 90 %     |
+
+Values are set to NA at the variable level (not row deletion) to preserve valid concurrent measurements from the same node.
+
+**P19 node malfunction:** Visual inspection revealed that P19's node experienced a malfunction episode characterized by rh >= 90% accompanied by simultaneous anomalous temperature readings. Both variables are set to NA for all minutes where P19's rh >= 90% to remove the entire malfunction episode. This participant-specific correction is justified by device malfunction confirmed during visual inspection.
+
+```{r IndEnvH-clean-raw}
+indoor_environment_participant <- indoor_environment_participant %>%
+  mutate(
+    # Definitive removal: physiologically implausible bounds
+    sensors.BME680.temp = case_when(
+      sensors.BME680.temp < 10 ~ NA_real_,  # Below 10 deg C -- implausible indoors
+      sensors.BME680.temp > 50 ~ NA_real_,  # Above 50 deg C -- sensor error
+      TRUE                     ~ sensors.BME680.temp
+    ),
+    sensors.BME680.rh = case_when(
+      sensors.BME680.rh < 5   ~ NA_real_,   
+      sensors.BME680.rh > 90  ~ NA_real_,  
+      TRUE                    ~ sensors.BME680.rh
+    ),
+    # P19 node malfunction correction:
+    # When rh >= 90 for P19, both temp and rh are set to NA
+    # because the malfunction affects both variables simultaneously
+    sensors.BME680.temp = ifelse(
+      participant_id == "P19" & sensors.BME680.rh >= 90,
+      NA_real_, sensors.BME680.temp
+    ),
+    sensors.BME680.rh = ifelse(
+      participant_id == "P19" & sensors.BME680.rh >= 90,
+      NA_real_, sensors.BME680.rh
+    )
+  )
+```
+
+## Re-aggregate to hourly on cleaned data
+
+```{r IndEnvH-aggregate-hourly-clean}
+# Re-aggregate using the same grouping as Step 2 but on cleaned data
+indoor_environment_hourly <- indoor_environment_participant %>%
+  group_by(participant_id, hour_floor, date_converted, period, heatwave_status) %>%
+  summarise(
+    temp_mean    = mean(sensors.BME680.temp, na.rm = TRUE),
+    temp_min     = min(sensors.BME680.temp,  na.rm = TRUE),
+    temp_max     = max(sensors.BME680.temp,  na.rm = TRUE),
+    temp_sd      = sd(sensors.BME680.temp,   na.rm = TRUE),
+    rh_mean      = mean(sensors.BME680.rh,   na.rm = TRUE),
+    rh_min       = min(sensors.BME680.rh,    na.rm = TRUE),
+    rh_max       = max(sensors.BME680.rh,    na.rm = TRUE),
+    rh_sd        = sd(sensors.BME680.rh,     na.rm = TRUE),
+    n_obs        = n(),
+    n_temp_valid = sum(!is.na(sensors.BME680.temp)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    across(c(temp_min, temp_max, rh_min, rh_max),
+           ~ ifelse(is.infinite(.), NA, .))
+  )
+
+message("Hourly records (cleaned): ", nrow(indoor_environment_hourly))
+```
+
+---
+
+# Step 6 - After filtering plots {#step6}
+```{r IndEnvH-plot-after, echo=FALSE}
+line_temp_pooled_after <- ggplot(
+  indoor_environment_hourly,
+  aes(x = hour_floor, y = temp_mean)
+) +
+  geom_point(color = "#2E86AB", size = 1, alpha = 0.85) +
+  labs(title = "After filtering",
+       x = "", y = "Average indoor temperature (deg C)") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text.x     = element_text(angle = 45, hjust = 1, size = 10))
+
+line_rh_pooled_after <- ggplot(
+  indoor_environment_hourly,
+  aes(x = hour_floor, y = rh_mean)
+) +
+  geom_point(color = "#2E86AB", size = 1, alpha = 0.85) +
+  labs(title = "After filtering",
+       x = "", y = "Average indoor relative humidity (%)") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text.x     = element_text(angle = 45, hjust = 1, size = 10))
+
+line_temp_pooled_flagged / line_temp_pooled_after +
+  plot_annotation(title = "Effect of data cleaning on average indoor temperature")
+
+line_rh_pooled_flagged / line_rh_pooled_after +
+  plot_annotation(title = "Effect of data cleaning on average indoor relative humidity")
+```
+
+---
+
+# Step 7 - Data completeness summary {#step7}
+
+```{r IndEnvH-completeness-summary}
+# Per-participant completeness summary
+summary_per_participant <- indoor_environment_hourly %>%
+  group_by(participant_id) %>%
+  summarise(
+    n_hours_total  = n(),
+    n_temp_valid   = sum(!is.na(temp_mean)),
+    pct_temp_valid = round(100 * mean(!is.na(temp_mean)), 1),
+    n_rh_valid     = sum(!is.na(rh_mean)),
+    pct_rh_valid   = round(100 * mean(!is.na(rh_mean)), 1),
+    .groups = "drop"
+  )
+print(summary_per_participant, n = Inf)
+
+# Overall completeness
+summary_overall <- indoor_environment_hourly %>%
+  summarise(
+    n_hours_total  = n(),
+    n_temp_valid   = sum(!is.na(temp_mean)),
+    pct_temp_valid = round(100 * mean(!is.na(temp_mean)), 1),
+    n_rh_valid     = sum(!is.na(rh_mean)),
+    pct_rh_valid   = round(100 * mean(!is.na(rh_mean)), 1)
+  )
+message("Overall: ", summary_overall$n_hours_total, " hours | ",
+        "Temp valid: ", summary_overall$pct_temp_valid, "% | ",
+        "RH valid: ", summary_overall$pct_rh_valid, "%")
+```
+
+
+## Distribution of cleaned variables
+
+```{r IndEnvH-distribution-boxplot, echo=FALSE}
+indoor_environment_hourly %>%
+  select(participant_id, temp_mean, temp_min, temp_max,
+         rh_mean, rh_min, rh_max) %>%
+  pivot_longer(
+    cols      = -participant_id,
+    names_to  = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(
+    type     = ifelse(grepl("temp", variable),
+                      "Temperature (deg C)", "Relative humidity (%)"),
+    variable = factor(variable,
+                      levels = c("temp_min", "temp_mean", "temp_max",
+                                 "rh_min",   "rh_mean",   "rh_max"))
+  ) %>%
+  ggplot(aes(x = variable, y = value, fill = variable)) +
+  geom_boxplot(outlier.colour = "red", outlier.size = 0.5, alpha = 0.5) +
+  facet_wrap(~ type, scales = "free_y") +
+  scale_fill_viridis_d() +
+  labs(title = "Distribution of indoor temperature and humidity after cleaning",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        axis.text.x     = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+# Step 8 - Final dataset and export {#step8}
+
+```{r IndEnvH-clean-final}
+# Remove intermediate QC columns not needed for analysis
+final_indoor_environment_hourly <- indoor_environment_hourly %>%
+  select(-n_obs, -n_temp_valid)
+```
+
+```{r IndEnvH-export}
+output_file <- file.path(path_res, "indoor_environment_hourly_processed.csv")
+write.csv(final_indoor_environment_hourly, output_file, row.names = FALSE)
+message("Exported: indoor_environment_hourly_processed.csv (",
+        nrow(final_indoor_environment_hourly), " rows x ",
+        ncol(final_indoor_environment_hourly), " columns)")
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

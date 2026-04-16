@@ -1,0 +1,396 @@
+---
+title: "Outdoor Environment HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-04"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+<!--
+================================================================================
+SCRIPT:  PRG/Environmental/outdoor_environment.Rmd
+PURPOSE: Data preparation pipeline for outdoor environmental data (temperature and relative humidity) from the Montreal meteorological station during the Montreal Heatwave 2024. This script:
+           1. Loads hourly outdoor data and assigns heatwave status
+           2. Exports hourly dataset for time-series analyses
+           3. Aggregates to daily summaries (mean, min, max)
+           4. Flags and removes implausible values
+           5. Exports daily processed dataset and QC plots
+
+INPUT FILES (DAT/):
+  - env_outdoor_hourly.csv          -> hourly outdoor temperature and humidity from Montreal meteorological station.  Note: column names are in French(Annee, Mois, Jour, Heure,Temp, Humidite.relative)
+
+OUTPUT FILES (DAT/Processed/):
+  - outdoor_environment_hourly.csv  -> hourly outdoor data with heatwave status
+  - outdoor_environment_processed.csv -> daily aggregated outdoor data
+
+IMPLAUSIBLE VALUE THRESHOLDS:
+  Temperature : avg_tp < 1 or > 45 deg C
+  Relative humidity : avg_rh < 1 or > 100 %
+
+
+NOTE ON COLUMN NAMES:
+  The source CSV uses French column names from Environment Canada:
+    Annee            -> year
+    Mois             -> month
+    Jour             -> day
+    Heure            -> hour (integer, e.g. 14 for 14:00)
+    Temp             -> temperature (deg C)
+    Humidite.relative -> relative humidity (%)
+  These are used directly -- do not rename the CSV headers.
+
+HEATWAVE PERIODS:
+  Before heatwave : 2024-06-11 to 2024-06-17
+  During heatwave : 2024-06-18 to 2024-06-20
+  After heatwave  : 2024-06-21 to 2024-06-27
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script prepares the **outdoor environment** dataset from hourly
+meteorological station data for Montreal during the Summer 2024 heatwave study.
+Two outputs are produced: an hourly dataset for time-series analyses and a daily aggregated dataset for statistical modelling.
+
+Unlike indoor data, outdoor data comes from a fixed station (not participant devices), so no participant ID assignment is needed.
+
+***
+
+# Environment setup
+
+## Load packages
+
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+required_packages <- c(
+  "here", "dplyr", "tidyr", "lubridate",
+  "ggplot2", "patchwork"
+)
+
+install_if_missing <- function(packages) {
+  missing <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing) > 0) install.packages(missing)
+}
+
+install_if_missing(required_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+## Set project root and directory paths
+
+```{r set-paths}
+here::i_am("PRG/Environmental/outdoor_environment.Rmd")
+
+path_dat <- here("DAT")           # Raw data folder
+path_prg <- here("PRG")           # Scripts folder
+path_res <- here("DAT/Processed") # Output folder for processed data
+```
+
+***
+
+# Step 1 - Load raw data {#step1}
+
+```{r OutEnv-upload}
+# Load hourly outdoor meteorological data from Environment Canada
+# Column names are in French -- see header block for mapping
+outdoor_environment_raw <- read.csv(
+  file.path(path_dat, "env_outdoor_hourly.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+***
+# Step 2 - Create hourly dataset {#step2}
+
+The hourly dataset preserves full temporal resolution for time-series analyses and is exported directly after heatwave status assignment.
+
+```{r OutEnv-create-hourly}
+# Parse date and hour from French column names
+# Note: Heure contains integer hour (e.g. 14), not "14:00"
+# Format "%Y-%m-%d-%H" handles integer hour correctly
+outdoor_hourly <- outdoor_environment_raw %>%
+  mutate(
+    hour_floor = as.POSIXct(
+      paste(Année, Mois, Jour, Heure, sep = "-"),
+      format = "%Y-%m-%d-%H"   # %H handles integer hour (0-23)
+    ),
+    date_converted = as.Date(paste(Année, Mois, Jour, sep = "-")),
+    temp_mean      = as.numeric(Temp),
+    rh_mean        = as.numeric(Humidite.relative)
+  ) %>%
+  # Remove rows where datetime parsing failed
+  filter(!is.na(hour_floor)) %>%
+  mutate(
+    heatwave_status = case_when(
+      date_converted >= as.Date("2024-06-18") & date_converted <= as.Date("2024-06-20") ~ "HW_June",
+      date_converted >= as.Date("2024-06-11") & date_converted <  as.Date("2024-06-18") ~ "BEF_HW_June",
+      date_converted >  as.Date("2024-06-20") & date_converted <= as.Date("2024-06-27") ~ "AFT_HW_June",
+      TRUE ~ "NoHW"
+    )
+  ) %>%
+  filter(heatwave_status != "NoHW") %>%
+  select(hour_floor, date_converted, heatwave_status, temp_mean, rh_mean)
+
+message("Hourly records retained: ", nrow(outdoor_hourly))
+```
+
+## Export hourly dataset
+
+```{r OutEnv-export-hourly}
+write.csv(
+  outdoor_hourly,
+  file      = file.path(path_res, "outdoor_environment_hourly.csv"),
+  row.names = FALSE
+)
+message("Exported: outdoor_environment_hourly.csv (",
+        nrow(outdoor_hourly), " rows)")
+```
+
+***
+
+# Step 3 - Create daily aggregated dataset {#step3}
+
+Hourly data is aggregated to daily summaries (mean, min, max) for each
+meteorological variable.
+
+
+
+```{r OutEnv-create-daily}
+outdoor_daily <- outdoor_environment_raw %>%
+  mutate(
+    date_converted = as.Date(paste(Année, Mois, Jour, sep = "-")),
+    temp           = Temp,
+    rh             = Humidite.relative
+  ) %>%
+  group_by(date_converted) %>%
+  summarise(
+    # Temperature summaries
+    avg_tp    = round(mean(temp, na.rm = TRUE), 2),
+    min_tp    = round(min(temp,  na.rm = TRUE), 2),
+    max_tp    = round(max(temp,  na.rm = TRUE), 2),
+    sample_tp = sum(!is.na(temp)),   # Number of valid hourly records
+    # Relative humidity summaries
+    avg_rh    = round(mean(rh, na.rm = TRUE), 2),
+    min_rh    = round(min(rh,  na.rm = TRUE), 2),
+    max_rh    = round(max(rh,  na.rm = TRUE), 2),
+    sample_rh = sum(!is.na(rh)),
+    .groups   = "drop"
+  ) %>%
+  mutate(
+    heatwave_status = case_when(
+      date_converted >= as.Date("2024-06-18") & date_converted <= as.Date("2024-06-20") ~ "HW_June",
+      date_converted >= as.Date("2024-06-11") & date_converted <  as.Date("2024-06-18") ~ "BEF_HW_June",
+      date_converted >  as.Date("2024-06-20") & date_converted <= as.Date("2024-06-27") ~ "AFT_HW_June",
+      TRUE ~ "NoHW"
+    ),
+    heatwave_status = factor(
+      heatwave_status,
+      levels = c("BEF_HW_June", "HW_June", "AFT_HW_June", "NoHW")
+    )
+  )
+```
+
+
+
+```{r OutEnv-inspect-daily}
+# Flag implausible values BEFORE removing them for visual inspection
+outdoor_daily <- outdoor_daily %>%
+  mutate(
+    temp_flag = case_when(
+      is.na(avg_tp) ~ NA_real_,
+      avg_tp < 1    ~ 1,
+      avg_tp > 45   ~ 1,
+      TRUE          ~ 0
+    ),
+    rh_flag = case_when(
+      is.na(avg_rh) ~ NA_real_,
+      avg_rh < 1    ~ 1,
+      avg_rh > 100  ~ 1,
+      TRUE          ~ 0
+    ),
+    measurement_type = case_when(
+      temp_flag == 1 ~ "temp_flag",
+      rh_flag   == 1 ~ "rh_flag",
+      TRUE           ~ "Valid"
+    ),
+    measurement_type = factor(measurement_type,
+                               levels = c("Valid", "temp_flag", "rh_flag"))
+  )
+
+flag_colors <- c("Valid"     = "#2E86AB",
+                 "temp_flag" = "#F6AE2D",
+                 "rh_flag"   = "#E63946")
+flag_shapes <- c("Valid"     = 16,
+                 "temp_flag" = 17,
+                 "rh_flag"   = 4)
+
+outdoor_daily_filtered <- outdoor_daily %>%
+  filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June"))
+
+line_temp_bef <- ggplot(
+  outdoor_daily_filtered,
+  aes(x = date_converted, y = avg_tp)
+) +
+  geom_line(color = "grey", linewidth = 1, alpha = 0.6) +
+  geom_point(aes(color = measurement_type, shape = measurement_type),
+             size = 2.5, alpha = 0.85) +
+  scale_color_manual(values = flag_colors, name = "Type") +
+  scale_shape_manual(values = flag_shapes, name = "Type") +
+  labs(title = "Before filtering",
+       x = "", y = "Average outdoor temperature (deg C)") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text.x     = element_text(angle = 45, hjust = 1, size = 10))
+
+line_rh_bef <- ggplot(
+  outdoor_daily_filtered,
+  aes(x = date_converted, y = avg_rh)
+) +
+  geom_line(color = "grey", linewidth = 1, alpha = 0.6) +
+  geom_point(aes(color = measurement_type, shape = measurement_type),
+             size = 2.5, alpha = 0.85) +
+  scale_color_manual(values = flag_colors, name = "Type") +
+  scale_shape_manual(values = flag_shapes, name = "Type") +
+  labs(title = "Before filtering",
+       x = "", y = "Average outdoor relative humidity (%)") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text.x     = element_text(angle = 45, hjust = 1, size = 10))
+```
+
+## Restrict to study period
+
+```{r OutEnv-filter-heatwave}
+final_outdoor_environment <- outdoor_daily %>%
+  filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June"))
+
+message("Daily records retained: ", nrow(final_outdoor_environment))
+```
+
+***
+
+# Step 4 - Flag and remove implausible values {#step4}
+
+Implausible values are flagged based on meteorologically plausible ranges for Montreal in June:
+
+| Variable | Flag condition |
+|---|---|
+| avg_tp | < 1 deg C or > 45 deg C |
+| avg_rh | < 1% or > 100% |
+```{r OutEnv-flag-implausible}
+final_outdoor_environment <- final_outdoor_environment %>%
+  mutate(
+    temp_flag = case_when(
+      is.na(avg_tp)  ~ NA_real_,
+      avg_tp < 1     ~ 1,
+      avg_tp > 45    ~ 1,   
+      TRUE           ~ 0
+    ),
+    rh_flag = case_when(
+      is.na(avg_rh)  ~ NA_real_,
+      avg_rh < 1     ~ 1, 
+      avg_rh > 100   ~ 1,   
+      TRUE           ~ 0
+    )
+  )
+
+message("=== Temperature implausible values ===")
+message("N implausible: ",
+        sum(final_outdoor_environment$temp_flag == 1, na.rm = TRUE))
+message("% implausible: ",
+        round(mean(final_outdoor_environment$temp_flag == 1,
+                   na.rm = TRUE) * 100, 2), "%")
+
+message("=== Relative humidity implausible values ===")
+message("N implausible: ",
+        sum(final_outdoor_environment$rh_flag == 1, na.rm = TRUE))
+message("% implausible: ",
+        round(mean(final_outdoor_environment$rh_flag == 1,
+                   na.rm = TRUE) * 100, 2), "%")
+
+# Remove flagged rows
+n_before <- nrow(final_outdoor_environment)
+final_outdoor_environment <- final_outdoor_environment %>%
+  filter(temp_flag == 0 & rh_flag == 0) %>%
+  select(-temp_flag, -rh_flag)
+
+message("Rows removed (implausible values): ",
+        n_before - nrow(final_outdoor_environment))
+```
+
+***
+# Step 5 - QC plots {#step5}
+
+## Outdoor temperature over time
+
+```{r OutEnv-plot-temperature, echo=FALSE}
+line_temp_pooled_after <- ggplot(
+  final_outdoor_environment,
+  aes(x = date_converted, y = avg_tp)
+) +
+  geom_line(color = "grey", linewidth = 1, alpha = 0.85) +
+  geom_point(color = "#2E86AB", size = 2.5, alpha = 0.85) +
+  labs(title = "Outdoor temperature after filtering",
+       x = "", y = "Average outdoor temperature (deg C)") +
+  theme_minimal() +
+  theme(legend.position  = "right",
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 10))
+
+```
+
+## Outdoor relative humidity over time
+
+```{r OutEnv-plot-humidity, echo=FALSE}
+line_rh_pooled_after <- ggplot(
+  final_outdoor_environment,
+  aes(x = date_converted, y = avg_rh)
+) +
+  geom_line(color = "grey", linewidth = 1, alpha = 0.85) +
+  geom_point(color = "#2E86AB", size = 2.5, alpha = 0.85) +
+  labs(title = "Outdoor relative humidity after filtering",
+       x = "", y = "Average outdoor relative humidity (%)") +
+  theme_minimal() +
+  theme(legend.position  = "right",
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 10))
+
+```
+
+```{r plot-bef-after}
+line_temp_bef / line_temp_pooled_after +
+  plot_annotation(title = "Effect of data cleaning on outdoor temperature")
+
+line_rh_bef / line_rh_pooled_after +
+  plot_annotation(title = "Effect of data cleaning on outdoor relative humidity")
+
+```
+
+***
+
+# Step 6 - Export daily processed dataset {#step6}
+
+```{r OutEnv-export}
+output_file <- file.path(path_res, "outdoor_environment_processed.csv")
+write.csv(final_outdoor_environment, output_file, row.names = FALSE)
+message("Exported: outdoor_environment_processed.csv (",
+        nrow(final_outdoor_environment), " rows x ",
+        ncol(final_outdoor_environment), " columns)")
+```
+
+***
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

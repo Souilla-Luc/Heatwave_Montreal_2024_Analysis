@@ -1,0 +1,662 @@
+---
+title: "Main Analysis Physiological HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-05"
+output: 
+ html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+
+<!--
+================================================================================
+SCRIPT:  PRG/Physiological/main_analysis_physio.Rmd
+PURPOSE: Descriptive and inferential analysis of all physiological outcomes collected during the Montreal heatwave 2024. This script:
+           1. Loads all processed physiological datasets
+           2. Produces descriptive statistics tables (pooled and participant-level)
+           3. Produces time series and boxplot visualizations
+           4. Runs linear mixed models (MMRM) for two-factor and one-factor designs
+           5. Explores the moderating effect of air conditioning (AC) access
+
+INPUT FILES (DAT/Processed/):
+  - blood_pressure_processed.csv           -> cleaned BP and HR (3x daily)
+  - oral_temp_processed.csv                -> cleaned oral temperature (3x daily)
+  - body_mass_processed.csv                -> cleaned body mass (daily, AM only)
+  - urine_data_processed.csv               -> cleaned urine frequency (daily)
+  - daily_physical_activity_processed.csv  -> cleaned mean daily acceleration (daily)
+
+OUTPUT FILES (RES/Physiological/):
+  - Table/table_pooled_two_ways_heatwave.xlsx -> pooled descriptive stats (two-factor)
+  - Table/Table_two_ways_participant.xlsx     -> participant-weighted stats (two-factor)
+  - Table/Table_one_way_participant.xlsx      -> participant-weighted stats (one-factor)
+  - Graph/ (plots saved automatically by custom functions)
+
+STUDY DESIGN:
+  Two-factor outcomes (heatwave x period of day -- AM/PM/NI):
+    Blood pressure (SBP, DBP, MAP, HR) and oral temperature -- measured 3x daily
+  One-factor outcomes (heatwave only -- BEF/HW/AFT):
+    Body mass, urine frequency, mean daily acceleration -- measured once daily
+
+DESCRIPTIVE STATISTICS -- TWO APPROACHES:
+  Option 1 (group_by_participant = FALSE): all observations pooled across participants before computing statistics. Participants with more measurements carry more weight. Used for population-level summaries.
+
+  Option 2 (group_by_participant = TRUE): statistics computed per participant first, then averaged across participants. Each participant contributes equally regardless of number of measurements. Used for publication tables.
+
+STATISTICAL APPROACH:
+  Mixed Model Repeated Measures (MMRM) with AR(1) covariance structure.
+  Fixed effects tested with car::Anova() Type II (Kenward-Roger df).
+  Post-hoc comparisons with emmeans() using mvt adjustment.
+
+AC STATUS NOTE:
+  Air conditioning status derived from participant self-report at baseline. Hardcoded list verified against characteristics_participants.csv. Update manually if study population changes.
+
+HEATWAVE PERIODS:
+  Before heatwave : 2024-06-11 to 2024-06-17
+  During heatwave : 2024-06-18 to 2024-06-20
+  After heatwave  : 2024-06-21 to 2024-06-27
+
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script performs descriptive and inferential analyses of all physiological outcomes measured during the Montreal heatwave 2024.
+
+Outcomes are organized into two analytical designs:
+
+- **Two-factor design** (heatwave x period of day): blood pressure, heart rate, oral temperature -- measured three times daily (AM/PM/NI)
+- **One-factor design** (heatwave only): body mass, urine frequency, physical activity -- measured once daily
+
+---
+
+# Environment setup
+
+## Load packages
+
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+# Required packages -- duplicates removed (lubridate, stringr)
+required_packages <- c(
+  # Data wrangling
+  "here", "dplyr", "tidyr", "lubridate", "stringr", "purrr",
+  # Reporting
+  "knitr", "kableExtra", "openxlsx",
+  # Visualization
+  "ggplot2", "patchwork", "viridis", "ggeffects",
+  # Statistical modelling
+  "rstatix", "carData", "car", "emmeans", "mmrm",
+  "mlogit", "ordinal", "glmmTMB"
+)
+
+# Install any missing packages automatically
+install_if_missing <- function(packages) {
+  missing_packages <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing_packages) > 0) {
+    install.packages(missing_packages)
+  }
+}
+
+# Load all packages silently
+load_packages <- function(packages) {
+  lapply(packages, library, character.only = TRUE)
+}
+
+install_if_missing(required_packages)
+load_packages(required_packages)
+```
+
+## Set project root and directory paths
+
+```{r set-paths, message=FALSE, warning=FALSE, include=FALSE}
+# Anchor here() to the project root from this script's location
+here::i_am("PRG/Physiological/main_analysis_physio.Rmd")
+```
+
+```{r define-paths}
+# FIX: corrected capitalisation from "DAT/processed" to "DAT/Processed"
+# to match actual folder name (case-sensitive on Mac/Linux)
+path_dat <- here("DAT/Processed")       # Processed data inputs
+path_prg <- here("PRG")                 # Scripts folder
+path_res <- here("RES/Physiological")   # Results output folder
+```
+
+## Set global color palette
+
+We define colors for plotting using the `viridis` package, which provides a color-blind-friendly palette applied globally to all ggplot2 figures.
+
+```{r set-color-palette, echo=FALSE, warning=FALSE}
+scale_color_discrete <- function(...) scale_color_viridis_d(...)
+scale_fill_discrete  <- function(...) scale_fill_viridis_d(...)
+```
+
+## Source custom analysis functions
+
+```{r source-functions}
+# All custom functions used in this script
+# See each .R file in PRG/Functions/ for full documentation and parameters
+source(here("PRG/Functions/functions_participant_period.R"))
+source(here("PRG/Functions/functions_cleaning_data.R"))
+source(here("PRG/Functions/functions_adjusted_ref_time.R"))
+source(here("PRG/Functions/functions_descriptive_stats.R"))  # descriptive_stats(), display_table()
+source(here("PRG/Functions/functions_descriptive_plot.R"))   # time_series_*, boxplot_numeric()
+source(here("PRG/Functions/functions_linear_models.R"))      # lmm_two_way(), lmm_one_way(), lmm_*_AC()
+source(here("PRG/Functions/residual_check_mmrm.R")) # add R code inside this file to check MMRM assumptions and model fit for continuous outcomes
+source(here("PRG/Functions/functions_check_clmm.R")) # add R code inside this file to check clmm assumptions and model fit for ordinal outcomes 
+```
+
+
+---
+
+# Load processed data {#load-data}
+
+```{r load-data}
+# Blood pressure and heart rate -- three measurements per day (AM, PM, NI)
+final_blood_pressure_data <- read.csv(
+  file.path(path_dat, "blood_pressure_processed.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+
+# Oral temperature -- three measurements per day (AM, PM, NI)
+final_core_temp_data <- read.csv(
+  file.path(path_dat, "oral_temp_processed.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+
+# Body mass -- one measurement per day (morning only per protocol)
+final_body_mass_data <- read.csv(
+  file.path(path_dat, "body_mass_processed.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+
+# Urine frequency -- one self-reported entry per day
+final_urine_data <- read.csv(
+  file.path(path_dat, "urine_data_processed.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+
+# Mean daily acceleration -- one aggregated value per day
+final_activity_data_day <- read.csv(
+  file.path(path_dat, "daily_physical_activity_processed.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+
+---
+
+# Physiological descriptive tables {#descriptive-tables}
+
+For both descriptive tables and plots, outcomes are organized into two input
+lists: `data_list` (the processed dataframes) and `outcome_vars` (the columns
+of interest). Two analytical designs are used based on measurement frequency:
+
+- **Two-factor** (heatwave x period of day): outcomes measured 3x daily
+- **One-factor** (heatwave only): outcomes measured once daily
+
+The `descriptive_stats()` function computes mean, SD, median, and quantiles.
+To modify descriptive statistics features, edit `PRG/Functions/functions_descriptive_stats.R`.
+
+## Two-factor outcomes: blood pressure and oral temperature {#two-factor}
+
+### Define input lists
+
+```{r StatDesc-2-ways-list, echo=FALSE, message=FALSE, warning=FALSE}
+# data_list: named list mapping keys to processed dataframes
+# Each key is referenced by name in outcome_vars below
+data_list_num_two_way <- list(
+  bp_data   = final_blood_pressure_data,
+  temp_data = final_core_temp_data
+)
+
+# outcome_vars: named list specifying each outcome variable
+# Fields: data = key in data_list, var = column name,
+#         date = date column, day_time = time column for visit ordering
+outcome_vars_num_two_way <- list(
+  "Systolic Blood Pressure (mmHg)"      = list(data = "bp_data",   var = "sbp",            date = "date_converted", day_time = "unix_time_converted"),
+  "Diastolic Blood Pressure (mmHg)"     = list(data = "bp_data",   var = "dbp",            date = "date_converted", day_time = "unix_time_converted"),
+  "Mean Arterial Pressure (mmHg)"       = list(data = "bp_data",   var = "map",            date = "date_converted", day_time = "unix_time_converted"),
+  "Heart Rate (bpm)"                    = list(data = "bp_data",   var = "hr",             date = "date_converted", day_time = "unix_time_converted"),
+  "Oral Temperature (deg C)"            = list(data = "temp_data", var = "temp_corrected", date = "date_converted", day_time = "unix_time_converted"),
+  "Daily change\nOral Temperature (deg C)" = list(data = "temp_data", var = "delta_oral_temp", date = "date_converted", day_time = "unix_time_converted")
+)
+```
+
+### Option 1 -- Population-level summary (pooled across participants)
+
+In this approach, all observations are pooled before computing statistics. Participants with more measurements contribute more to the group summary. Useful for population-level description.
+
+```{r StatDesc-2-ways-calcul}
+# Group by heatwave period AND period of day -- pooled across participants
+outcome_table_period <- descriptive_stats(
+  data_list_num_two_way,
+  outcome_vars_num_two_way,
+  group_by_participant = FALSE,
+  group_by             = "heatwave_period",
+  categorical_grouping = FALSE,
+  numeric_variable     = TRUE
+)
+display_table(outcome_table_period)
+
+# Group by heatwave period only -- pooled across participants and periods of day
+outcome_table_heatwave <- descriptive_stats(
+  data_list_num_two_way,
+  outcome_vars_num_two_way,
+  group_by_participant = FALSE,
+  group_by             = "heatwave",
+  categorical_grouping = FALSE,
+  numeric_variable     = TRUE
+)
+display_table(outcome_table_heatwave)
+```
+
+### Save Option 1 tables
+
+```{r save-two-way-pooled-tables}
+# Rename to preserve objects before next table generation
+table_period   <- outcome_table_period
+table_heatwave <- outcome_table_heatwave
+
+# Export both tables to a single Excel workbook with separate sheets
+wb <- createWorkbook()
+addWorksheet(wb, "By_period")
+writeData(wb, "By_period",   table_period$stats)
+addWorksheet(wb, "By_heatwave")
+writeData(wb, "By_heatwave", table_heatwave$stats)
+saveWorkbook(
+  wb,
+  file      = here("RES/Physiological/Table/table_pooled_two_ways_heatwave.xlsx"),
+  overwrite = TRUE
+)
+message("Exported: table_pooled_two_ways_heatwave.xlsx")
+```
+
+### Option 2 -- Participant-weighted summary (recommended for publication)
+
+Here, statistics are first computed per participant, then averaged across participants. Each participant contributes equally regardless of how many measurements they have. This is the recommended approach for repeated-measures physiological data as it avoids bias from unequal measurement counts.
+
+```{r StatDesc-2-ways-calcul-2}
+# Group by heatwave x period of day -- participant-weighted
+outcome_table_participant_hw_period <- descriptive_stats(
+  data_list_num_two_way,
+  outcome_vars_num_two_way,
+  group_by_participant = TRUE,
+  group_by             = "heatwave_period",
+  categorical_grouping = FALSE,
+  numeric_variable     = TRUE
+)
+display_table(outcome_table_participant_hw_period)
+
+# Group by heatwave period only -- participant-weighted
+outcome_table_participant_hw <- descriptive_stats(
+  data_list_num_two_way,
+  outcome_vars_num_two_way,
+  group_by_participant = TRUE,
+  group_by             = "heatwave",
+  categorical_grouping = FALSE,
+  numeric_variable     = TRUE
+)
+display_table(outcome_table_participant_hw)
+```
+
+### Save Option 2 tables
+
+```{r save-two-way-participant-tables}
+# Rename to preserve objects
+outcome_table_participant_heatwave_period <- outcome_table_participant_hw_period
+outcome_table_participant_heatwave        <- outcome_table_participant_hw
+
+wb <- createWorkbook()
+addWorksheet(wb, "By_heatwave_period")
+writeData(wb, "By_heatwave_period", outcome_table_participant_heatwave_period$stats)
+addWorksheet(wb, "By_heatwave")
+writeData(wb, "By_heatwave",        outcome_table_participant_heatwave$stats)
+saveWorkbook(
+  wb,
+  file      = here("RES/Physiological/Table/Table_two_ways_participant.xlsx"),
+  overwrite = TRUE
+)
+message("Exported: Table_two_ways_participant.xlsx")
+```
+
+
+---
+
+## One-factor outcomes: body mass, physical activity, urine {#one-factor}
+
+### Define input lists
+
+```{r StatDesc-1-way-list, echo=FALSE, message=FALSE, warning=FALSE}
+# data_list: named list mapping keys to processed dataframes
+data_list_num_one_way <- list(
+  mass_data          = final_body_mass_data,
+  total_movement_day = final_activity_data_day,
+  urine_frequency    = final_urine_data
+)
+
+# outcome_vars: one entry per outcome of interest
+# No day_time field needed -- these are daily outcomes with no period of day
+outcome_vars_num_one_way <- list(
+  "Body Mass (kg)"                = list(data = "mass_data",          var = "mass",           date = "date_converted"),
+  "Daily change\nBody Mass (g)"   = list(data = "mass_data",          var = "delta_bodymass", date = "date_converted"),
+  "Mean Daily Acceleration (mg)"  = list(data = "total_movement_day", var = "mean_acc_day",   date = "date_converted"),
+  "Urine Frequency per Day"       = list(data = "urine_frequency",    var = "urineFreq",      date = "date_converted")
+)
+```
+
+### Option 1 -- Population-level summary (pooled)
+
+```{r StatDesc-1-ways-calcul}
+# Group by heatwave period -- pooled across participants
+outcome_table_one_way_heatwave <- descriptive_stats(
+  data_list_num_one_way,
+  outcome_vars_num_one_way,
+  group_by_participant = FALSE,
+  group_by             = "heatwave",
+  categorical_grouping = FALSE,
+  numeric_variable     = TRUE
+)
+display_table(outcome_table_one_way_heatwave)
+```
+
+### Option 2 -- Participant-weighted summary (recommended for publication)
+
+```{r StatDesc-1-ways-calcul-2}
+# Group by heatwave period -- participant-weighted (recommended)
+outcome_table_one_way_participant <- descriptive_stats(
+  data_list_num_one_way,
+  outcome_vars_num_one_way,
+  group_by_participant = TRUE,
+  group_by             = "heatwave",
+  categorical_grouping = FALSE,
+  numeric_variable     = TRUE
+)
+display_table(outcome_table_one_way_participant)
+```
+
+### Save one-factor tables
+
+```{r save-one-way-tables}
+# Rename to preserve objects
+table_one_way_heatwave           <- outcome_table_one_way_heatwave
+table_one_way_participant_heatwave <- outcome_table_one_way_participant
+
+# Export to Excel: By_heatwave = pooled, By_heatwave_participant = weighted
+wb <- createWorkbook()
+addWorksheet(wb, "By_heatwave")
+writeData(wb, "By_heatwave",             table_one_way_heatwave$stats)
+addWorksheet(wb, "By_heatwave_participant")
+writeData(wb, "By_heatwave_participant", table_one_way_participant_heatwave$stats)
+saveWorkbook(
+  wb,
+  file      = here("RES/Physiological/Table/Table_one_way_participant.xlsx"),
+  overwrite = TRUE
+)
+message("Exported: Table_one_way_participant.xlsx")
+```
+
+
+---
+
+# Descriptive plots {#descriptive-plots}
+
+Plots are generated by custom functions in `PRG/Functions/functions_descriptive_plot.R` and saved automatically to `RES/Physiological/Graph/`. See that file for full documentation of each plotting function.
+
+## Boxplots by heatwave period
+
+The box represents the interquartile range (IQR) with median shown as a
+horizontal line. Jittered grey points show individual repeated measurements. Red points indicate statistical outliers beyond 1.5x IQR within each group.
+
+```{r Plot-boxplot-num-hw, echo=FALSE, fig.height=25, fig.width=20, message=FALSE, warning=FALSE}
+# Boxplots for two-factor outcomes (BP and temperature) grouped by heatwave period
+boxplot_numeric(
+  data_list_num_two_way,
+  outcome_vars_num_two_way,
+  plot_type  = "heatwave",
+  output_dir = here("RES/Physiological/Graph")
+)
+```
+
+## Time series plots
+
+The following time series plots show mean values per day with 95% confidence intervals. Vertical dashed lines mark heatwave start and end. Thin grey lines connect daily values for the same participant. Bold colored lines show the group mean per heatwave period (BEF/HW/AFT).
+
+> Note: The individual `time_series_heatwave_period()` calls below are set to `eval=FALSE` -- they produce intermediate exploratory plots. The combined publication-ready plots are produced by `time_series_combine_plot_*()` below.
+
+```{r eval=FALSE, fig.height=8, fig.width=6, message=FALSE, warning=FALSE, include=FALSE}
+# Exploratory: separate plots by period of day only (not saved to RES)
+time_series_heatwave_period(
+  data_list_num_two_way, outcome_vars_num_two_way,
+  group_by  = "period",
+  common_x  = FALSE,
+  output_dir = here("RES/Physiological/Graph")
+)
+```
+
+```{r eval=FALSE, fig.height=8, fig.width=8, message=FALSE, warning=FALSE, include=FALSE}
+# Exploratory: separate plots by heatwave status only (not saved to RES)
+time_series_heatwave_period(
+  data_list_num_two_way, outcome_vars_num_two_way,
+  group_by   = "heatwave_status",
+  common_x   = FALSE,
+  output_dir = here("RES/Physiological/Graph")
+)
+```
+
+### Two-factor combined time series (publication figure)
+
+```{r Plot-time-series-2way-combine, fig.height=16, fig.width=19, message=FALSE, warning=FALSE}
+# Subset of variables selected for the publication figure
+# MAP excluded here as SBP, DBP and HR are the primary outcomes reported
+data_list_num_two_way_final <- list(
+  bp_data   = final_blood_pressure_data,
+  temp_data = final_core_temp_data
+)
+
+outcome_vars_num_two_way_final <- list(
+  "Systolic Blood Pressure (mmHg)"         = list(data = "bp_data",   var = "sbp",            date = "date_converted", day_time = "unix_time_converted"),
+  "Diastolic Blood Pressure (mmHg)"        = list(data = "bp_data",   var = "dbp",            date = "date_converted", day_time = "unix_time_converted"),
+  "Heart Rate (bpm)"                       = list(data = "bp_data",   var = "hr",             date = "date_converted", day_time = "unix_time_converted"),
+  "Daily change\nOral Temperature (deg C)" = list(data = "temp_data", var = "delta_oral_temp", date = "date_converted", day_time = "unix_time_converted")
+)
+
+# Combined plot: all outcomes in one figure, faceted by period of day
+time_series_combine_plot_two_way(
+  data_list_num_two_way_final,
+  outcome_vars_num_two_way_final,
+  output_dir = here("RES/Physiological/Graph")
+)
+```
+
+```{r Plot-time-series-2way-individual, fig.height=16, fig.width=19, message=FALSE, warning=FALSE}
+# Same combined figure with individual participant trajectories overlaid
+# Thin grey lines = individual participants, thick colored line = group mean
+time_series_combine_plot_two_way_individual(
+  data_list_num_two_way_final,
+  outcome_vars_num_two_way_final,
+  output_dir = here("RES/Physiological/Graph")
+)
+```
+
+### One-factor combined time series (publication figure)
+
+```{r Plot-time-series-1way-combine, message=FALSE, warning=FALSE}
+# Subset of one-factor variables for the publication figure
+# Body mass absolute value excluded -- only delta shown
+data_list_num_one_way_final <- list(
+  mass_data          = final_body_mass_data,
+  total_movement_day = final_activity_data_day,
+  urine_frequency    = final_urine_data
+)
+
+outcome_vars_num_one_way_final <- list(
+  "Daily change\nBody Mass (g)"  = list(data = "mass_data",          var = "delta_bodymass", date = "date_converted"),
+  "Mean Daily Acceleration (mg)" = list(data = "total_movement_day", var = "mean_acc_day",   date = "date_converted"),
+  "Urine Frequency per Day"      = list(data = "urine_frequency",    var = "urineFreq",      date = "date_converted")
+)
+
+# Combined plot: all one-factor outcomes in one figure
+time_series_combine_plot_one_way(
+  data_list_num_one_way_final,
+  outcome_vars_num_one_way_final,
+  output_dir = here("RES/Physiological/Graph")
+)
+```
+
+```{r Plot-time-series-1way-individual, message=FALSE, warning=FALSE}
+# Same combined figure with individual participant trajectories overlaid
+time_series_combine_plot_one_way_individual(
+  data_list_num_one_way_final,
+  outcome_vars_num_one_way_final,
+  output_dir = here("RES/Physiological/Graph")
+)
+```
+
+---
+
+# Air conditioning subgroup analysis {#ac-analysis}
+
+We investigate whether access to air conditioning (AC) moderates the effect of the heatwave on physiological outcomes.
+
+## Assign AC status and update data lists
+
+```{r define-ac-status}
+# Participants with air conditioning access at home
+# Derived from self-report at baseline (characteristics_participants.csv, ApartmentAC column)
+# Hardcoded for reproducibility -- update if study population changes
+participants_with_AC <- c(
+  "P01", "P02", "P03", "P04", "P06", "P08", "P09", "P10",
+  "P11", "P13", "P16", "P17", "P19", "P21", "P24", "P25", "P26"
+)
+
+# Add binary AC indicator (1 = AC, 0 = no AC) to all physiological datasets
+# Two-factor outcomes (measured 3x daily)
+final_blood_pressure_data$AC <- ifelse(
+  final_blood_pressure_data$participant_id %in% participants_with_AC, 1, 0
+)
+final_core_temp_data$AC <- ifelse(
+  final_core_temp_data$participant_id %in% participants_with_AC, 1, 0
+)
+
+# One-factor outcomes (measured once daily)
+final_body_mass_data$AC <- ifelse(
+  final_body_mass_data$participant_id %in% participants_with_AC, 1, 0
+)
+final_urine_data$AC <- ifelse(
+  final_urine_data$participant_id %in% participants_with_AC, 1, 0
+)
+final_activity_data_day$AC <- ifelse(
+  final_activity_data_day$participant_id %in% participants_with_AC, 1, 0
+)
+
+# Update all data lists with the AC-enriched dataframes
+# This must be done before calling any AC plot or model functions
+data_list_num_two_way$bp_data            <- final_blood_pressure_data
+data_list_num_two_way$temp_data          <- final_core_temp_data
+data_list_num_one_way$mass_data          <- final_body_mass_data
+data_list_num_one_way$urine_frequency    <- final_urine_data
+data_list_num_one_way$total_movement_day <- final_activity_data_day
+```
+
+## Time series by AC status -- one-factor outcomes
+
+```{r plot-ac-one-way}
+# Plot one-factor outcomes split by AC status (AC vs no AC)
+# Uses outcome_vars_num_one_way_final defined in the plots section above
+time_series_heatwave_AC(
+  data_list_num_one_way,
+  outcome_vars_num_one_way_final,
+  group_by   = "heatwave",
+  output_dir = here("RES/Physiological/Graph")
+)
+```
+
+## Time series by AC status -- two-factor outcomes
+
+```{r plot-ac-two-way}
+# Redefine outcome_vars for two-factor AC plots
+# outcome_vars_num_two_way_final updated here to reflect current variable names
+outcome_vars_num_two_way_final <- list(
+  "Systolic Blood Pressure (mmHg)"         = list(data = "bp_data",   var = "sbp",            date = "date_converted", day_time = "unix_time_converted"),
+  "Diastolic Blood Pressure (mmHg)"        = list(data = "bp_data",   var = "dbp",            date = "date_converted", day_time = "unix_time_converted"),
+  "Heart Rate (bpm)"                       = list(data = "bp_data",   var = "hr",             date = "date_converted", day_time = "unix_time_converted"),
+  "Daily change\nOral Temperature (deg C)" = list(data = "temp_data", var = "delta_oral_temp", date = "date_converted", day_time = "unix_time_converted")
+)
+
+# Plot two-factor outcomes split by AC status
+time_series_heatwave_AC(
+  data_list_num_two_way,
+  outcome_vars_num_two_way_final,
+  group_by   = "heatwave",
+  output_dir = here("RES/Physiological/Graph")
+)
+```
+
+---
+
+# Statistical analysis: Linear mixed models {#lmm}
+
+
+## Two-factor MMRM: heatwave x period of day
+
+```{r lmm-stats-2way, echo=FALSE, message=FALSE, warning=FALSE}
+# Fits MMRM with heatwave_status * period as fixed effects and AR(1) covariance
+# See PRG/Functions/functions_linear_models.R for full model specification
+lmm_two_way(
+  data_list_num_two_way,
+  outcome_vars_num_two_way,
+  posthoc = TRUE
+)
+```
+
+## One-factor MMRM: heatwave period only
+
+```{r lmm-stats-1way, echo=FALSE, message=FALSE, warning=FALSE}
+# Fits MMRM with heatwave_status as the only fixed effect
+# Applied to daily outcomes without period-of-day structure
+lmm_one_way(
+  data_list_num_one_way,
+  outcome_vars_num_one_way,
+  posthoc = TRUE
+)
+```
+
+## Effect of air conditioning -- two-factor outcomes
+
+```{r lmm-ac-two-way}
+# MMRM including AC status as a moderator for two-factor outcomes
+lmm_two_way_AC(
+  data_list_num_two_way,
+  outcome_vars_num_two_way,
+  posthoc = TRUE
+)
+```
+
+## Effect of air conditioning -- one-factor outcomes
+
+```{r lmm-ac-one-way}
+# MMRM including AC status as a moderator for one-factor outcomes
+lmm_one_way_AC(
+  data_list_num_one_way,
+  outcome_vars_num_one_way,
+  posthoc = TRUE
+)
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

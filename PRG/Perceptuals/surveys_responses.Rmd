@@ -1,0 +1,587 @@
+---
+title: "Survey Responses HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-04"
+output: 
+ html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+
+<!--
+================================================================================
+SCRIPT:  PRG/Perceptuals/surveys_responses.Rmd
+PURPOSE: Data preparation pipeline for perceptual survey responses collected via smartwatch during the Montreal heatwave 2024 .
+         This script:
+           1. Assigns participant IDs and heatwave status to raw survey data
+           2. Filters to the seven perceptual survey keys of interest
+           3. Removes duplicate responses within a 10-minute window
+           4. Merges with sleep data to assign reference times per period
+           5. Selects one response per participant per key per period per day
+              using a custom approach adapted to the multi-key survey structure
+           6. Exports the clean final dataset
+
+INPUT FILES (DAT/):
+  - survey.csv                  -> raw survey responses from smartwatch
+  - baseline_long.csv           -> participant-macID-date lookup
+                                   (from Data_preparation.Rmd)
+  - sleep_analysis_daily.csv    -> daily sleep start/end times per participant
+
+OUTPUT FILES (DAT/Processed/):
+  - survey_processed.csv        -> cleaned survey responses (long format)
+
+SURVEY KEYS RETAINED:
+  sleep, at-home, comfort, sensation, preference, sweating, thirst
+
+DUPLICATE HANDLING -- CUSTOM APPROACH:
+  Standard physiological deduplication (get_surrounding_indices /
+  remove_farthest_measure) cannot be used for survey data because adjacent rows in the dataset belong to DIFFERENT keys of the same questionnaire instance, not to duplicate responses of the same key.
+
+  Instead, a two-step approach is used:
+    Step 1: Remove responses taken within 10 minutes of a prior response
+            for the same participant/date/period/key (keep the last one).
+            Rationale: the questionnaire takes at most 150 seconds -- a
+            second response within 10 minutes is a correction attempt,
+            not a genuinely independent measurement.
+    Step 2: For any remaining duplicates (> 10 min apart), retain the
+            response closest to the period reference time:
+              AM  -> awakening time (from sleep analysis)
+              PM  -> 15:00
+              NI  -> bedtime (adjusted for post-midnight measurements)
+
+
+HEATWAVE PERIODS:
+  Before heatwave : 2024-06-11 to 2024-06-17
+  During heatwave : 2024-06-18 to 2024-06-20
+  After heatwave  : 2024-06-21 to 2024-06-27
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script prepares the **perceptual survey** dataset collected via smartwatch during the Montreal heatwave 2024. Survey responses cover seven perceptual dimensions: sleep quality, presence at home, thermal comfort, thermal sensation, thermal preference, sweating, and thirst.
+
+The deduplication approach is adapted specifically for the multi-key survey structure (see the header block for full rationale).
+
+---
+
+# Environment setup
+
+## Load packages
+
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+required_packages <- c(
+  "here", "dplyr", "tidyr", "lubridate",
+  "ggplot2", "patchwork", "purrr"
+)
+
+install_if_missing <- function(packages) {
+  missing <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing) > 0) install.packages(missing)
+}
+
+install_if_missing(required_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+## Set project root and directory paths
+
+```{r set-paths}
+here::i_am("PRG/Perceptuals/surveys_responses.Rmd")
+
+path_dat <- here("DAT")           # Raw data folder
+path_prg <- here("PRG")           # Scripts folder
+path_res <- here("DAT/Processed") # Output folder for processed data
+```
+
+## Source custom functions
+
+```{r source-functions}
+# Participant ID assignment, period labelling, heatwave status
+source(here("PRG/Functions/functions_participant_period.R"))
+# Reference-time assignment per period (AM/PM/NI)
+source(here("PRG/Functions/functions_cleaning_data.R"))
+# Night-period reference time adjustment for post-midnight measurements
+source(here("PRG/Functions/functions_adjusted_ref_time.R"))
+```
+
+---
+
+# Step 1 - Load raw data and assign participant IDs {#step1}
+
+## Load raw survey data
+
+```{r Survey-upload}
+# Load raw survey responses exported from smartwatch platform
+# Data is in long format: one row per survey key per participant per response
+
+survey_raw <- read.csv(
+  file.path(path_dat, "survey.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+
+# Load participant-macID-date lookup table
+# Created by Data_preparation.Rmd -- must be run first
+baseline_long <- read.csv(
+  file.path(path_dat, "baseline_long.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+
+## Assign study period, participant ID, and heatwave status
+
+```{r Survey-assign-participant}
+# Step 1a: Convert unix timestamp and assign period of day (AM / PM / NI)
+survey_participant <- assign_study_period(survey_raw, c("unix"))
+
+# Step 1b: Match each row to a participant_id using macID + date_converted
+# Note: survey_raw already contains a local_time column. date_converted is
+# used here for matching because it is a stable date-level key consistent
+# with the survey data structure. Verify class(survey_raw$local_time) --
+# if it is POSIXct, switching to time_col = "local_time" may improve precision.
+survey_participant <- add_participant_id_watch(
+  survey_participant,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "date_converted"
+)
+
+# Step 1c: Assign heatwave status and restrict to the monitoring window
+survey_participant <- assign_heatwave(survey_participant)
+
+survey_participant <- survey_participant %>%
+  filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June"))
+```
+
+## QC: inspect available survey keys
+
+```{r Survey-inspect-keys}
+# Display all unique survey keys found in the data
+# This is a QC step to confirm the expected keys are present before filtering
+survey_participant_class <- unique(survey_participant$key)
+message("Survey keys available: ", paste(sort(survey_participant_class), collapse = ", "))
+```
+
+## Filter to perceptual survey keys of interest
+
+```{r filter-survey-keys}
+# Retain only the seven perceptual dimensions used in this study
+# All other keys (device diagnostics, additional lifestyle items) are excluded
+survey_participant <- survey_participant %>%
+  filter(key %in% c("sleep", "at-home", "comfort", "sensation",
+                    "preference", "sweating", "thirst"))
+
+message("Rows retained after key filter: ", nrow(survey_participant))
+```
+
+
+---
+
+# Step 2 - Duplicate detection and removal {#step2}
+
+Survey responses may be duplicated for two reasons:
+
+1. **Rapid re-entry (< 10 min):** A participant submitted a response and
+   immediately corrected it by completing the survey again. Since each
+   questionnaire takes at most 150 seconds, a second response within 10
+   minutes is treated as a correction = only the last response is retained.
+
+2. **Multiple completions (> 10 min apart):** A participant genuinely
+   completed the survey more than once during the same period. These are
+   resolved in Step 4 using reference-time selection.
+
+## Step 2a - Remove rapid re-entries (10-minute window)
+
+```{r Survey-remove-rapid-duplicates}
+survey_duplicate <- survey_participant %>%
+  mutate(
+    # Convert unix_time_converted to POSIXct for time difference calculation
+    survey_time = as.POSIXct(unix_time_converted, origin = "1970-01-01", tz = "UTC")
+  ) %>%
+  arrange(participant_id, date_converted, period, key, survey_time) %>%
+  group_by(participant_id, date_converted, period, key) %>%
+  mutate(
+    # Time elapsed since the previous response for the same key/period/day (seconds)
+    time_diff_key = as.numeric(difftime(survey_time, lag(survey_time), units = "secs")),
+    n_responses   = n(),
+    response_rank = row_number(),
+
+    # Classify each response:
+    #   Valid                        -> single response, or responses > 10 min apart
+    #   Remove - Duplicate (<10min) -> earlier response within a 10-min window (removed)
+    #   Keep - Last response (<10min) -> most recent response within a 10-min window (kept)
+    duplicate_flag = case_when(
+      n_responses == 1                                                               ~ "Valid",
+      !is.na(time_diff_key) & time_diff_key <= 600 & response_rank < n_responses   ~ "Remove - Duplicate (<10min)",
+      !is.na(time_diff_key) & time_diff_key <= 600 & response_rank == n_responses  ~ "Keep - Last response (<10min)",
+      TRUE                                                                           ~ "Valid"
+    )
+  ) %>%
+  ungroup()
+
+# Summary of duplicate flags
+message("=== Duplicate flags (10-minute window) ===")
+print(table(survey_duplicate$duplicate_flag))
+
+message("\n=== Duplicates removed by survey key ===")
+survey_duplicate %>%
+  filter(duplicate_flag == "Remove - Duplicate (<10min)") %>%
+  count(key) %>%
+  print()
+
+message("\n=== Duplicates removed by participant ===")
+survey_duplicate %>%
+  filter(duplicate_flag == "Remove - Duplicate (<10min)") %>%
+  count(participant_id) %>%
+  print()
+
+# Remove flagged rapid duplicates -- keep all Valid and Keep-Last rows
+survey_data_cleaned <- survey_duplicate %>%
+  filter(duplicate_flag != "Remove - Duplicate (<10min)")
+
+message("\nRows before cleaning : ", nrow(survey_duplicate))
+message("Rows after cleaning  : ", nrow(survey_data_cleaned))
+message("Rows removed         : ", nrow(survey_duplicate) - nrow(survey_data_cleaned))
+```
+
+## Step 2b - Check remaining duplicates (> 10 min apart)
+
+```{r Survey-check-remaining-duplicates}
+# Identify cases where a participant still has more than one response
+# per key per period per day after the 10-minute window cleaning
+remaining_duplicates <- survey_data_cleaned %>%
+  group_by(participant_id, date_converted, period, key) %>%
+  summarise(
+    n_responses = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_responses > 1)
+
+message("=== Remaining duplicates after 10-min cleaning ===")
+message("N cases with > 1 response per key/period/day/participant: ",
+        nrow(remaining_duplicates))
+
+message("\n=== By survey key ===")
+remaining_duplicates %>% count(key) %>% print()
+
+message("\n=== By participant ===")
+remaining_duplicates %>% count(participant_id) %>% print()
+
+message("\n=== Details ===")
+print(remaining_duplicates)
+```
+
+
+---
+
+# Step 3 - Merge with sleep data for reference-time assignment {#step3}
+
+Remaining duplicates (> 10 min apart) are resolved by selecting the response closest to a physiologically meaningful reference time per period:
+
+- **AM:** closest to awakening time (from sleep analysis)
+- **PM:** closest to 15:00
+- **NI:** closest to bedtime (adjusted for post-midnight measurements)
+
+## Load and prepare sleep data
+
+```{r Survey-sleep-upload}
+# Load daily sleep analysis data for awakening and bedtime reference times
+sleep_analysis_raw <- read.csv(
+  file.path(path_dat, "sleep_analysis_daily.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+```{r Survey-sleep-assign-participant}
+# Derive local_time from sleepEnd for participant ID matching
+# EDT offset: -14400 seconds (UTC-4, valid for June 2024 Montreal)
+sleep_analysis_raw <- sleep_analysis_raw %>%
+  mutate(
+    local_time = as.Date(
+      as.POSIXct(sleepEnd, origin = "1970-01-01", tz = "UTC") - 14400
+    )
+  )
+
+sleep_analysis_participant <- add_participant_id_watch(
+  sleep_analysis_raw,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+```
+
+```{r Survey-sleep-filter, message=FALSE, warning=FALSE}
+# Convert Unix timestamps to local Montreal time and extract date components
+sleep_analysis_participant <- sleep_analysis_participant %>%
+  mutate(
+    # Apply EDT offset (-14400 s) to convert UTC unix to local Montreal time
+    sleepStart_time = as.POSIXct(sleepStart, origin = "1970-01-01", tz = "UTC") - 14400,
+    sleepEnd_time   = as.POSIXct(sleepEnd,   origin = "1970-01-01", tz = "UTC") - 14400,
+    date_bedtime    = as.Date(sleepStart_time),
+    date_awakening  = as.Date(sleepEnd_time)
+  ) %>%
+  # Restrict to heatwave monitoring window (June 9-29, 2024)
+  filter(
+    (sleepStart_time >= as.POSIXct("2024-06-09 00:00:00") &
+     sleepStart_time <= as.POSIXct("2024-06-29 23:59:59")) |
+    (sleepEnd_time   >= as.POSIXct("2024-06-09 00:00:00") &
+     sleepEnd_time   <= as.POSIXct("2024-06-29 23:59:59"))
+  )
+
+# Retain only physiologically plausible sleep episodes
+sleep_analysis_filter <- sleep_analysis_participant %>%
+  select(participant_id, macID, sleepStart, sleepEnd,
+         sleepStart_time, sleepEnd_time, date_bedtime, date_awakening) %>%
+  filter(
+    format(sleepEnd_time,    "%H:%M") >= "03:00" &
+    format(sleepEnd_time,    "%H:%M") <= "11:59" &
+    (format(sleepStart_time, "%H:%M") >= "18:00" |
+     format(sleepStart_time, "%H:%M") <= "02:59")
+  )
+
+n_sleep_removed <- nrow(sleep_analysis_participant) - nrow(sleep_analysis_filter)
+message("Sleep records retained: ", nrow(sleep_analysis_filter),
+        " | Removed (implausible windows): ", n_sleep_removed)
+```
+
+## Merge survey and sleep data
+
+```{r Survey-merge-sleep}
+# Use date_awakening as the merge key (matches date_converted in survey data)
+sleep_analysis_filter <- sleep_analysis_filter %>%
+  mutate(date_converted = date_awakening)
+
+# Left join: every survey record is kept; sleep times added where available
+survey_data_cleaned <- survey_data_cleaned %>%
+  left_join(
+    sleep_analysis_filter,
+    by = c("macID", "participant_id", "date_converted")
+  )
+```
+
+## Assign reference times
+
+```{r Survey-reference-time}
+# Assign reference_time per period:
+#   AM -> awakening time (sleepEnd_time)
+#   PM -> 15:00 on date_converted
+#   NI -> bedtime (sleepStart_time)
+# See PRG/Functions/functions_cleaning_data.R for full details
+survey_sleep_merged <- set_reference_time(survey_data_cleaned)
+```
+
+```{r Survey-adjust-night-reference}
+# Adjust reference_time for NI measurements recorded after midnight
+# See PRG/Functions/functions_adjusted_ref_time.R for full details
+survey_sleep_merged <- set_adjusted_night_time(survey_sleep_merged)
+```
+
+## Verify night reference time adjustment
+
+```{r Survey-verify-night-reference}
+# Compute time difference between NI responses and adjusted bedtime
+survey_night_verif <- survey_sleep_merged %>%
+  filter(period == "NI") %>%
+  mutate(
+    time_diff_minutes = as.numeric(
+      difftime(unix_time_converted, adjusted_reference_time, units = "mins")
+    )
+  )
+
+time_diff_summary <- survey_night_verif %>%
+  summarise(
+    mean_diff = mean(time_diff_minutes, na.rm = TRUE),
+    sd_diff   = sd(time_diff_minutes,   na.rm = TRUE),
+    min_diff  = min(time_diff_minutes,  na.rm = TRUE),
+    max_diff  = max(time_diff_minutes,  na.rm = TRUE)
+  )
+
+message(
+  "NI period -- time between survey response and adjusted bedtime (minutes):",
+  "\n  Mean = ", round(time_diff_summary$mean_diff, 2),
+  " | SD = ",   round(time_diff_summary$sd_diff,   2),
+  " | Min = ",  round(time_diff_summary$min_diff,  2),
+  " | Max = ",  round(time_diff_summary$max_diff,  2)
+)
+```
+---
+
+# Step 4 - Select one response per participant per key per period {#step4}
+
+## Why standard deduplication functions cannot be used here
+
+The standard functions `get_surrounding_indices()` and `remove_farthest_measure()` were designed for physiological data where adjacent rows in the dataset are duplicate measurements of the **same variable**. For survey data, adjacent rows belong to **different keys** of the same questionnaire instance (e.g., `sensation` at 08:09 is followed by `comfort` at 08:09, not by a duplicate `sensation`).
+
+Applying the standard approach would incorrectly group `sensation` (09:01) with `comfort` (09:01) instead of comparing the two `sensation` responses (08:09 vs 09:01).
+
+**Solution:** group explicitly by `participant_id`, `date_converted`, `period`, and `key`, then retain the response with the smallest absolute time difference from the reference time. A `slice(1)` tiebreaker handles the rare case of two responses equidistant from the reference time.
+
+```{r Survey-select-reference-response}
+# Ungroup before applying the custom selection logic
+survey_sleep_merged <- survey_sleep_merged %>%
+  ungroup()
+
+final_survey_data <- survey_sleep_merged %>%
+  arrange(participant_id, date_converted, period, key, unix) %>%
+  group_by(participant_id, date_converted, period, key) %>%
+  mutate(
+    # Use adjusted_reference_time for NI period (accounts for post-midnight shift)
+    # Use reference_time for AM and PM
+    ref_time_to_use = if_else(
+      period == "NI" & !is.na(adjusted_reference_time),
+      adjusted_reference_time,
+      reference_time
+    ),
+    # Compute absolute time difference between response and reference time (seconds)
+    abs_time_diff = abs(as.numeric(
+      difftime(unix_time_converted, ref_time_to_use, units = "secs")
+    ))
+  ) %>%
+  # Keep only the response closest to the reference time
+  filter(abs_time_diff == min(abs_time_diff, na.rm = TRUE)) %>%
+  # Tiebreaker: if two responses are equidistant, keep the first (earliest)
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  # Remove intermediate helper columns
+  select(-abs_time_diff, -ref_time_to_use)
+```
+
+## Final duplicate verification
+
+```{r Survey-final-duplicate-check}
+# Confirm that no duplicates remain after reference-time selection
+remaining_duplicates_final <- final_survey_data %>%
+  group_by(participant_id, date_converted, period, key) %>%
+  summarise(n_responses = n(), .groups = "drop") %>%
+  filter(n_responses > 1)
+
+message("=== Final duplicate check ===")
+message("N cases with > 1 response per key/period/day/participant: ",
+        nrow(remaining_duplicates_final))
+
+if (nrow(remaining_duplicates_final) > 0) {
+  message("WARNING: Duplicates remain -- investigate before export")
+  remaining_duplicates_final %>% count(key) %>% print()
+  remaining_duplicates_final %>% count(participant_id) %>% print()
+} else {
+  message("Passed: one response per participant per key per period per day.")
+}
+```
+
+---
+
+# Step 5 - QC heatmap: duplicate survey keys per period {#step5}
+
+Visualize the number of duplicate survey keys per participant per period per day before and after cleaning, to confirm that deduplication was effective.
+
+```{r Survey-heatmap, echo=FALSE}
+all_participants <- sort(unique(final_survey_data$participant_id))
+n_per_page       <- 4
+n_pages          <- ceiling(length(all_participants) / n_per_page)
+
+# Store original data before loop to prevent accidental overwrite
+original_data <- final_survey_data %>%
+  arrange(participant_id, date_converted, period) %>%
+  mutate(
+    heatwave_status = factor(heatwave_status,
+                             levels = c("BEF_HW_June", "HW_June", "AFT_HW_June")),
+    period          = factor(period, levels = c("AM", "PM", "NI"))
+  )
+
+for (i in seq_len(n_pages)) {
+  start_idx         <- (i - 1) * n_per_page + 1
+  end_idx           <- min(i * n_per_page, length(all_participants))
+  participants_page <- all_participants[start_idx:end_idx]
+
+  # Use a temporary subset -- never overwrite original_data inside the loop
+  heatmap_data <- original_data %>%
+    filter(participant_id %in% participants_page) %>%
+    group_by(participant_id, date_converted, period, key) %>%
+    summarise(
+      n_responses = n(),   # count responses per key/period/day/participant
+      .groups = "drop"
+    ) %>%
+    group_by(participant_id, date_converted, period) %>%
+    summarise(
+      # Number of keys that still have more than one response (should be 0 after cleaning)
+      n_duplicates = sum(n_responses > 1),
+      .groups = "drop"
+    )
+
+  heatmap_indiv <- ggplot(
+    heatmap_data,
+    aes(x = date_converted, y = period, fill = n_duplicates)
+  ) +
+    geom_tile(color = "grey") +
+    scale_fill_gradient(
+      low  = "white",    # white = no duplicates remaining
+      high = "#E63946",  # red = duplicates still present
+      name = "N duplicate\nkeys"
+    ) +
+    facet_wrap(~ participant_id, nrow = 2, ncol = 2) +
+    labs(title = paste("Duplicate survey keys after cleaning -- page", i),
+         x     = "",
+         y     = "Period of the day") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+
+  print(heatmap_indiv)
+}
+```
+
+
+---
+
+# Step 6 - Final dataset and export {#step6}
+
+## Remove intermediate processing columns
+
+```{r Survey-clean-final}
+# Remove columns used only for QC and intermediate processing
+# Note: time_diff_minutes was computed on a filtered NI subset only
+#       and is NOT a column in final_survey_data -- do not attempt to drop it
+final_survey_data <- final_survey_data %>%
+  select(
+    -survey_time, -unix, -id,
+    -sleepStart_time, -sleepEnd_time,
+    -date_bedtime, -date_awakening,
+    -sleepStart, -sleepEnd,
+    -hours_discrepancy, -adjusted_reference_time,
+    -duplicate_flag, -reference_time,
+    -n_responses, -response_rank, -time_diff_key, -local_time,-local_date,-time_diff_minutes
+  )
+```
+
+## Export processed dataset
+
+```{r Survey-export}
+# Export clean survey dataset to DAT/Processed/ for use in perceptual analyses
+output_file <- file.path(path_res, "survey_processed.csv")
+write.csv(final_survey_data, output_file, row.names = FALSE)
+message("Exported: survey_processed.csv (",
+        nrow(final_survey_data), " rows x ",
+        ncol(final_survey_data), " columns)")
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
+
+

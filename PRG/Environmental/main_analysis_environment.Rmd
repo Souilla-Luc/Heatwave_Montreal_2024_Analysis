@@ -1,0 +1,773 @@
+---
+title: "Main Analysis Environment HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+
+<!--
+================================================================================
+SCRIPT:  PRG/Environmental/main_analysis_environment.Rmd
+PURPOSE: Descriptive and inferential analysis of indoor and outdoor
+         environmental data (temperature, relative humidity) collected
+         during the Montreal Summer 2024 heatwave study. This script:
+           1. Loads all processed environmental datasets
+           2. Produces descriptive statistics tables by heatwave period
+           3. Computes threshold exceedance summaries (26 and 31 deg C)
+           4. Produces time series plots (pooled and by AC status)
+           5. Runs linear mixed models on indoor environment
+           6. Visualizes indoor temperature by building characteristics
+
+INPUT FILES (DAT/Processed/):
+  - indoor_environment_processed.csv        -> daily indoor temp and RH
+  - outdoor_environment_processed.csv       -> daily outdoor temp and RH
+  - indoor_environment_hourly_processed.csv -> hourly indoor temp and RH
+  - outdoor_environment_hourly.csv          -> hourly outdoor temp and RH
+  - characteristics_participants.csv        -> baseline participant data
+
+OUTPUT FILES (RES/Environmental/):
+  - Table/table_pooled_env_heatwave.xlsx    -> descriptive stats tables
+  - Graph/building_characteristics_temperature.png
+  - Graph/building_characteristics_temp_max.png
+  - Graph/ (additional plots saved by custom functions)
+
+STATISTICAL APPROACH:
+  Mixed Model Repeated Measures (MMRM) with AR(1) covariance structure.
+  Fixed effects tested with car::Anova() Type II (Kenward-Roger df).
+  Post-hoc comparisons with emmeans() using mvt adjustment.
+  Rationale: see narrative in Statistical Methods section below.
+
+AC STATUS NOTE:
+  Air conditioning status is derived from participant self-report at
+  baseline. The list below was verified against characteristics_participants.csv and is hardcoded for reproducibility. If participants are added or removed, this list must be updated manually.
+
+HEATWAVE PERIODS:
+  Before heatwave : 2024-06-11 to 2024-06-17
+  During heatwave : 2024-06-18 to 2024-06-20
+  After heatwave  : 2024-06-21 to 2024-06-27
+
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script performs descriptive and inferential analyses of indoor and
+outdoor environmental conditions during the Montreal Summer 2024 heatwave.
+Analyses include descriptive statistics by heatwave period, threshold
+exceedance summaries, time series visualizations, linear mixed models,
+and exploratory plots of building characteristics.
+
+---
+
+# Environment setup
+
+## Load packages
+
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+required_packages <- c(
+  # Data wrangling
+  "here", "dplyr", "tidyr", "lubridate", "zoo", "stringr", "purrr",
+  # Reporting
+  "knitr", "kableExtra", "openxlsx",
+  # Visualization
+  "ggplot2", "patchwork", "viridis", "ggeffects",
+  # Statistical modelling
+  "rstatix", "carData", "car", "emmeans", "mmrm",
+  "mlogit", "ordinal", "glmmTMB"
+)
+
+install_if_missing <- function(packages) {
+  missing <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing) > 0) install.packages(missing)
+}
+
+install_if_missing(required_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+## Set project root and directory paths
+
+```{r set-paths}
+here::i_am("PRG/Environmental/main_analysis_environment.Rmd")
+
+path_dat <- here("DAT/Processed")       # Processed data inputs
+path_prg <- here("PRG")                 # Scripts folder
+path_res <- here("RES/Environmental")   # Results output folder
+```
+
+
+## Set global color palette
+
+```{r set-color-palette, echo=FALSE, warning=FALSE}
+# Override ggplot2 discrete scales globally with viridis (color-blind friendly)
+scale_color_discrete <- function(...) scale_color_viridis_d(...)
+scale_fill_discrete  <- function(...) scale_fill_viridis_d(...)
+```
+
+## Source custom analysis functions
+
+```{r source-functions}
+# All custom functions used in this script
+# See each .R file in PRG/Functions/ for full documentation
+source(here("PRG/Functions/functions_cleaning_data.R"))
+source(here("PRG/Functions/functions_descriptive_stats.R"))  # descriptive_stats(), display_table()
+source(here("PRG/Functions/functions_descriptive_plot.R"))   # time_series_ functions
+source(here("PRG/Functions/functions_linear_models.R"))      # lmm_one_way(), lmm_one_way_AC(), lmm_recovery()
+source(here("PRG/Functions/residual_check_mmrm.R"))
+source(here("PRG/Functions/functions_check_clmm.R"))
+```
+
+---
+
+# Load processed data {#load-data}
+
+```{r load-data}
+# Daily indoor environment (temperature and relative humidity)
+final_indoor_environment_data <- read.csv(
+  file.path(path_dat, "indoor_environment_processed.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+
+# Daily outdoor environment (temperature and relative humidity)
+final_outdoor_environment_data <- read.csv(
+  file.path(path_dat, "outdoor_environment_processed.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+
+# Hourly indoor environment
+final_indoor_environment_hourly <- read.csv(
+  file.path(path_dat, "indoor_environment_hourly_processed.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+
+# Hourly outdoor environment
+final_outdoor_environment_hourly <- read.csv(
+  file.path(path_dat, "outdoor_environment_hourly.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+
+# Baseline participant characteristics (for building characteristics section)
+final_baseline <- read.csv(
+  file.path(path_dat, "characteristics_participants.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Convert hourly timestamps to POSIXct
+
+```{r convert-hourly-timestamps}
+
+final_indoor_environment_hourly <- final_indoor_environment_hourly %>%
+  mutate(hour_floor = lubridate::ymd_hms(hour_floor, truncated = 3))
+
+final_outdoor_environment_hourly <- final_outdoor_environment_hourly %>%
+  mutate(hour_floor = lubridate::ymd_hms(hour_floor, truncated = 3))
+```
+
+---
+
+# Define analysis variable lists {#variable-lists}
+
+## Indoor environment variables (daily, participant-level)
+
+```{r define-indoor-list}
+
+data_list_num_environmental <- list(
+  indoor_environment = final_indoor_environment_data %>%
+    mutate(period = "AM")
+)
+
+# Each entry specifies: display label, source dataframe, variable name, date column
+outcome_vars_num_environmental <- list(
+  "Indoor Average Temperature (°C)" = list(
+    data = "indoor_environment", var = "temp_avg", date = "date_converted"),
+  "Indoor Minimal Temperature (°C)" = list(
+    data = "indoor_environment", var = "temp_min", date = "date_converted"),
+  "Indoor Maximal Temperature (°C)" = list(
+    data = "indoor_environment", var = "temp_max", date = "date_converted"),
+  "Indoor Average Relative Humidity (%)" = list(
+    data = "indoor_environment", var = "rh_avg",   date = "date_converted")
+)
+```
+
+
+## Outdoor environment variables (daily, station-level)
+
+```{r define-outdoor-list}
+# Outdoor data is station-level (not participant-level)
+# participant_id = "Outdoor" is set as a placeholder to satisfy
+# the descriptive_stats() function signature which requires this column
+final_outdoor_environment_data <- final_outdoor_environment_data %>%
+  mutate(participant_id = "Outdoor")
+
+data_list_num_no_participant <- list(
+  outdoor_environment = final_outdoor_environment_data
+)
+
+outcome_vars_num_no_participant <- list(
+  "Outdoor Average Temperature (deg C)" = list(
+    data = "outdoor_environment", var = "avg_tp", date = "date_converted"),
+  "Outdoor Minimal Temperature (deg C)" = list(
+    data = "outdoor_environment", var = "min_tp", date = "date_converted"),
+  "Outdoor Maximal Temperature (deg C)" = list(
+    data = "outdoor_environment", var = "max_tp", date = "date_converted"),
+  "Outdoor Average Relative Humidity (%)" = list(
+    data = "outdoor_environment", var = "avg_rh", date = "date_converted")
+)
+```
+
+
+## Hourly environment variables (indoor and outdoor)
+
+```{r define-hourly-list}
+data_list_num_environmental_hourly <- list(
+  indoor_environment_hourly  = final_indoor_environment_hourly,
+  outdoor_environment_hourly = final_outdoor_environment_hourly
+)
+
+outcome_vars_num_environmental_hourly <- list(
+  "Indoor Average Temperature (deg C)" = list(
+    data = "indoor_environment_hourly",  var = "temp_mean", date = "hour_floor"),
+  "Indoor Minimal Temperature (deg C)" = list(
+    data = "indoor_environment_hourly",  var = "temp_min",  date = "hour_floor"),
+  "Indoor Maximal Temperature (deg C)" = list(
+    data = "indoor_environment_hourly",  var = "temp_max",  date = "hour_floor"),
+  "Indoor Average Relative Humidity (%)" = list(
+    data = "indoor_environment_hourly",  var = "rh_mean",   date = "hour_floor"),
+  "Outdoor Average Temperature (deg C)" = list(
+    data = "outdoor_environment_hourly", var = "temp_mean", date = "hour_floor"),
+  "Outdoor Average Relative Humidity (%)" = list(
+    data = "outdoor_environment_hourly", var = "rh_mean",   date = "hour_floor")
+)
+```
+
+---
+
+# Descriptive statistics {#descriptive-stats}
+
+We use the custom `descriptive_stats()` function to compute mean, SD, median, and quantiles for each outcome variable grouped by heatwave period.
+See `PRG/Functions/functions_descriptive_stats.R` for full documentation.
+
+## Indoor environment by heatwave period
+
+
+```{r StatDesc-indoor-heatwave}
+outcome_table_heatwave_indoor <- descriptive_stats(
+  data_list_num_environmental,
+  outcome_vars_num_environmental,
+  group_by_participant = TRUE,
+  group_by             = "heatwave",
+  categorical_grouping = FALSE,
+  numeric_variable     = TRUE
+)
+display_table(outcome_table_heatwave_indoor)
+```
+
+## Outdoor environment by heatwave period
+
+```{r StatDesc-outdoor-heatwave}
+outcome_table_heatwave_outdoor <- descriptive_stats(
+  data_list_num_no_participant,
+  outcome_vars_num_no_participant,
+  group_by_participant = FALSE,
+  group_by             = "heatwave",
+  categorical_grouping = FALSE,
+  numeric_variable     = TRUE
+)
+display_table(outcome_table_heatwave_outdoor)
+```
+
+---
+
+# Temperature threshold exceedance {#thresholds}
+
+We compute the number and proportion of daily observations exceeding two
+indoor temperature thresholds recommended in the heat-health literature:
+
+- **26 deg C** — commonly used threshold for indoor thermal discomfort
+- **31 deg C** — threshold associated with susceptible to increased health risk during heatwaves
+
+Results are grouped by participant and heatwave period.
+
+## Threshold: 26 deg C
+
+```{r threshold-26}
+threshold_TP_26 <- final_indoor_environment_data %>%
+  filter(heatwave_status %in% c("HW_June", "BEF_HW_June", "AFT_HW_June")) %>%
+  mutate(
+    heatwave_status = factor(
+      heatwave_status,
+      levels = c("BEF_HW_June", "HW_June", "AFT_HW_June")
+    )
+  ) %>%
+  group_by(heatwave_status, participant_id) %>%
+  summarize(
+    # Average temperature summary
+    mean_temp_avg    = round(mean(temp_avg, na.rm = TRUE), 2),
+    n_above_26_avg   = sum(temp_avg > 26,  na.rm = TRUE),
+    n_below_26_avg   = sum(temp_avg <= 26, na.rm = TRUE),
+    pct_above_26_avg = round(mean(temp_avg > 26, na.rm = TRUE) * 100, 1),
+    total_avg        = sum(!is.na(temp_avg)),
+    # Maximal temperature summary
+    mean_temp_max    = round(mean(temp_max, na.rm = TRUE), 2),
+    n_above_26_max   = sum(temp_max > 26,  na.rm = TRUE),
+    n_below_26_max   = sum(temp_max <= 26, na.rm = TRUE),
+    pct_above_26_max = round(mean(temp_max > 26, na.rm = TRUE) * 100, 1),
+    total_max        = sum(!is.na(temp_max)),
+    .groups = "drop"
+  )
+
+display_table(threshold_TP_26)
+```
+
+## Threshold: 31 deg C
+
+```{r threshold-31}
+threshold_TP_31 <- final_indoor_environment_data %>%
+  filter(heatwave_status %in% c("HW_June", "BEF_HW_June", "AFT_HW_June")) %>%
+  mutate(
+    heatwave_status = factor(
+      heatwave_status,
+      levels = c("BEF_HW_June", "HW_June", "AFT_HW_June")
+    )
+  ) %>%
+  group_by(heatwave_status, participant_id) %>%
+  summarize(
+    # Average temperature summary
+    mean_temp_avg    = round(mean(temp_avg, na.rm = TRUE), 2),
+    n_above_31_avg   = sum(temp_avg > 31,  na.rm = TRUE),
+    n_below_31_avg   = sum(temp_avg <= 31, na.rm = TRUE),
+    pct_above_31_avg = round(mean(temp_avg > 31, na.rm = TRUE) * 100, 1),
+    total_avg        = sum(!is.na(temp_avg)),
+    # Maximal temperature summary
+    mean_temp_max    = round(mean(temp_max, na.rm = TRUE), 2),
+    n_above_31_max   = sum(temp_max > 31,  na.rm = TRUE),
+    n_below_31_max   = sum(temp_max <= 31, na.rm = TRUE),
+    pct_above_31_max = round(mean(temp_max > 31, na.rm = TRUE) * 100, 1),
+    total_max        = sum(!is.na(temp_max)),
+    .groups = "drop"
+  )
+
+display_table(threshold_TP_31)
+```
+
+---
+
+# Save descriptive tables to Excel {#save-tables}
+
+```{r save-tables}
+# Rename to avoid overwriting objects used in plots
+table_heatwave_indoor  <- outcome_table_heatwave_indoor
+table_heatwave_outdoor <- outcome_table_heatwave_outdoor
+
+# Export all tables to a single Excel workbook with separate sheets
+wb <- createWorkbook()
+addWorksheet(wb, "Indoor_heatwave")
+writeData(wb, "Indoor_heatwave",  table_heatwave_indoor$stats)
+
+addWorksheet(wb, "Outdoor_heatwave")
+writeData(wb, "Outdoor_heatwave", table_heatwave_outdoor$stats)
+
+addWorksheet(wb, "Threshold_over_31")
+writeData(wb, "Threshold_over_31", threshold_TP_31)
+
+saveWorkbook(
+  wb,
+  file      = here("RES/Environmental/Table/table_pooled_env_heatwave.xlsx"),
+  overwrite = TRUE
+)
+message("Exported: table_pooled_env_heatwave.xlsx (3 sheets)")
+```
+
+---
+
+# Descriptive plots {#descriptive-plots}
+
+## Time series plots
+
+The following time series plots show each outcome variable per heatwave
+period (BEF/HW/AFT). Vertical dashed lines mark the start and end of the
+heatwave. Each point represents the daily mean for one participant. Thin
+grey lines connect measurements from the same participant across days.
+Shaded areas represent 95% confidence intervals of the group mean.
+
+Plots are generated by the custom `time_series_*` functions and saved
+automatically to `RES/Environmental/Graph/`. See `PRG/Functions/functions_descriptive_plot.R` for full documentation.
+
+```{r plot-timeseries-heatwave, warning=FALSE}
+# Pooled time series by heatwave period and period of day
+# Note: eval=FALSE version (time_series_heatwave_period) omitted here as
+# the combined plot below provides equivalent information in a cleaner format
+time_series_combine_plot_environment(
+  data_list_num_environmental,
+  outcome_vars_num_environmental,
+  output_dir = here("RES/Environmental/Graph")
+)
+```
+
+```{r plot-timeseries-individual, warning=FALSE}
+# Individual participant trajectories overlaid on group mean
+time_series_combine_plot_environment_individual(
+  data_list_num_environmental,
+  outcome_vars_num_environmental,
+  output_dir = here("RES/Environmental/Graph")
+)
+```
+
+## Hourly time series by heatwave phase
+
+```{r plot-hourly-timeseries, warning=FALSE}
+# Hourly resolution plots for indoor and outdoor variables
+# Shows diurnal patterns within each heatwave phase
+time_series_environment_by_phase(
+  data_list_num_environmental_hourly,
+  outcome_vars_num_environmental_hourly,
+  output_dir = here("RES/Environmental/Graph")
+)
+```
+
+
+---
+
+# Air conditioning subgroup analysis {#ac-analysis}
+
+We investigate the effect of air conditioning (AC) access on indoor
+temperature. AC status is derived from participant self-report at baseline.
+
+## Define AC status
+
+```{r define-ac-status}
+# Participants with access to air conditioning
+# Verified against characteristics_participants.csv (ApartmentAC column)
+# Hardcoded for reproducibility -- update if study population changes
+participants_with_AC <- c(
+  "P01", "P02", "P03", "P04", "P06", "P08", "P09", "P10",
+  "P11", "P13", "P16", "P17", "P19", "P21", "P24", "P25", "P26"
+)
+
+# Add AC binary indicator to indoor environment data
+final_indoor_environment_data <- final_indoor_environment_data %>%
+  mutate(
+    AC = ifelse(participant_id %in% participants_with_AC, 1, 0)
+  )
+
+# Update the data list to use the AC-enriched dataframe
+data_list_num_environmental$indoor_environment <- final_indoor_environment_data
+```
+
+## Time series plots by AC status
+
+```{r plot-ac-timeseries, warning=FALSE}
+# Compare indoor temperature trajectories between AC and non-AC participants
+time_series_heatwave_AC(
+  data_list_num_environmental,
+  outcome_vars_num_environmental,
+  group_by   = "heatwave",
+  output_dir = here("RES/Environmental/Graph")
+)
+```
+
+
+
+---
+
+# Statistical analysis: Linear mixed models {#lmm}
+
+
+## Main effect of heatwave period
+
+```{r lmm-main-effect}
+# One-way MMRM: effect of heatwave period (BEF / HW / AFT) on indoor
+# environment variables. posthoc = TRUE runs emmeans pairwise comparisons.
+lmm_one_way(
+  data_list_num_environmental,
+  outcome_vars_num_environmental,
+  posthoc = TRUE
+)
+```
+
+## Effect of air conditioning
+
+```{r lmm-ac-effect}
+# MMRM including AC status as a moderator variable
+lmm_one_way_AC(
+  data_list_num_environmental,
+  outcome_vars_num_environmental,
+  posthoc = TRUE
+)
+```
+
+## Recovery analysis
+
+```{r lmm-recovery}
+# MMRM focused on the post-heatwave recovery period
+# Tests whether indoor environment returns to pre-heatwave levels
+lmm_recovery(
+  data_list_num_environmental,
+  outcome_vars_num_environmental
+)
+```
+
+---
+
+# Building characteristics and indoor temperature {#building-characteristics}
+
+Given the small sample size, formal statistical testing of building
+characteristic effects has insufficient power. We therefore use visual
+inspection to explore distributional patterns across building features.
+
+Six characteristics are examined: AC ownership, fan ownership, shading,
+number of rooms, thermal insulation (self-reported), and frequency of
+feeling too hot inside.
+
+> Note: P03, P14, P18, P23 are excluded from these plots as they have no indoor sensor data.
+
+## Prepare building characteristics dataset
+
+```{r prepare-building-data}
+# Join baseline building characteristics with daily indoor temperature
+plot_data <- final_baseline %>%
+  select(
+    participant_id,
+    ApartmentAC, ApartmentFansYesNo,
+    ApartmentShadeYesNo, ApartmentRooms,
+    ApartmentThermalInsulation,
+    ApartmentTooHotInside
+  ) %>%
+  filter(
+    !is.na(ApartmentAC),
+    !is.na(ApartmentFansYesNo),
+    !is.na(ApartmentShadeYesNo),
+    !is.na(ApartmentRooms)
+  ) %>%
+  inner_join(
+    final_indoor_environment_data %>%
+      filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June")) %>%
+      select(participant_id, date_converted, heatwave_status,
+             temp_avg, temp_min, temp_max, rh_avg),
+    by = "participant_id"
+  ) %>%
+  mutate(
+    ApartmentAC                = factor(ApartmentAC,
+                                        labels = c("No AC", "Owned AC")),
+    ApartmentFansYesNo         = factor(ApartmentFansYesNo,
+                                        labels = c("No fan", "Owned fan")),
+    ApartmentShadeYesNo        = factor(ApartmentShadeYesNo,
+                                        labels = c("No shade", "Shade")),
+    ApartmentThermalInsulation = factor(ApartmentThermalInsulation,
+                                        levels = c("bad", "adequately", "well")),
+    ApartmentTooHotInside      = factor(ApartmentTooHotInside,
+                                        levels = c("never", "monthly",
+                                                   "weekly", "daily")),
+    heatwave_status = factor(
+      heatwave_status,
+      levels = c("BEF_HW_June", "HW_June", "AFT_HW_June"),
+      labels = c("Pre-heatwave", "During heatwave", "Post-heatwave")
+    )
+  )
+```
+
+## Average indoor temperature by building characteristics
+
+```{r plot-building-avg, fig.height=30, fig.width=22}
+p_ac <- ggplot(plot_data,
+               aes(x = ApartmentAC, y = temp_avg, fill = ApartmentAC)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_viridis_d() +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = NULL, y = "Average indoor temperature (deg C)",
+       title = "Air conditioning") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", strip.text = element_text(size = 11))
+
+p_fan <- ggplot(plot_data,
+                aes(x = ApartmentFansYesNo, y = temp_avg,
+                    fill = ApartmentFansYesNo)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_viridis_d() +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = NULL, y = "Average indoor temperature (deg C)",
+       title = "Fans") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", strip.text = element_text(size = 11))
+
+p_shade <- ggplot(plot_data,
+                  aes(x = ApartmentShadeYesNo, y = temp_avg,
+                      fill = ApartmentShadeYesNo)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_viridis_d() +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = NULL, y = "Average indoor temperature (deg C)",
+       title = "Apartment in the shade during the day") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", strip.text = element_text(size = 11))
+
+p_rooms <- ggplot(plot_data, aes(x = ApartmentRooms, y = temp_avg)) +
+  geom_point(size = 1.5, alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE,
+              linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = "Number of rooms", y = "Average indoor temperature (deg C)",
+       title = "Number of rooms") +
+  theme_minimal(base_size = 13) +
+  theme(strip.text = element_text(size = 11))
+
+p_insulation <- ggplot(
+  plot_data %>% filter(!is.na(ApartmentThermalInsulation)),
+  aes(x = ApartmentThermalInsulation, y = temp_avg,
+      fill = ApartmentThermalInsulation)
+) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_viridis_d() +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = NULL, y = "Average indoor temperature (deg C)",
+       title = "Thermal insulation (self-reported)") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", strip.text = element_text(size = 11))
+
+p_toohot <- ggplot(
+  plot_data %>% filter(!is.na(ApartmentTooHotInside)),
+  aes(x = ApartmentTooHotInside, y = temp_avg,
+      fill = ApartmentTooHotInside)
+) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_viridis_d() +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = NULL, y = "Average indoor temperature (deg C)",
+       title = "Frequency of feeling too hot inside") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", strip.text = element_text(size = 11))
+
+combined_avg <- (p_ac / p_fan / p_shade / p_insulation / p_toohot / p_rooms) +
+  plot_annotation(
+    title    = "Building characteristics and average indoor temperature across heatwave phases",
+    subtitle = "Each point represents one daily observation. P03, P14, P18, P23 excluded (no indoor sensor)."
+  )
+
+print(combined_avg)
+
+ggsave(
+  filename = here("RES/Environmental/Graph/building_characteristics_temperature.png"),
+  plot     = combined_avg,
+  width    = 22, height = 30, dpi = 600, device = "png"
+)
+```
+
+## Maximal indoor temperature by building characteristics
+
+```{r plot-building-max, fig.height=30, fig.width=22}
+p_ac_max <- ggplot(plot_data,
+                   aes(x = ApartmentAC, y = temp_max, fill = ApartmentAC)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_viridis_d() +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = NULL, y = "Maximal indoor temperature (deg C)",
+       title = "Air conditioning") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", strip.text = element_text(size = 11))
+
+p_fan_max <- ggplot(plot_data,
+                    aes(x = ApartmentFansYesNo, y = temp_max,
+                        fill = ApartmentFansYesNo)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_viridis_d() +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = NULL, y = "Maximal indoor temperature (deg C)",
+       title = "Fans") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", strip.text = element_text(size = 11))
+
+p_shade_max <- ggplot(plot_data,
+                      aes(x = ApartmentShadeYesNo, y = temp_max,
+                          fill = ApartmentShadeYesNo)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_viridis_d() +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = NULL, y = "Maximal indoor temperature (deg C)",
+       title = "Apartment in the shade during the day") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", strip.text = element_text(size = 11))
+
+p_insulation_max <- ggplot(
+  plot_data %>% filter(!is.na(ApartmentThermalInsulation)),
+  aes(x = ApartmentThermalInsulation, y = temp_max,
+      fill = ApartmentThermalInsulation)
+) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_viridis_d() +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = NULL, y = "Maximal indoor temperature (deg C)",
+       title = "Thermal insulation (self-reported)") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", strip.text = element_text(size = 11))
+
+p_toohot_max <- ggplot(
+  plot_data %>% filter(!is.na(ApartmentTooHotInside)),
+  aes(x = ApartmentTooHotInside, y = temp_max,
+      fill = ApartmentTooHotInside)
+) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1, alpha = 0.4) +
+  scale_fill_viridis_d() +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = NULL, y = "Maximal indoor temperature (deg C)",
+       title = "Frequency of feeling too hot inside") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", strip.text = element_text(size = 11))
+
+p_rooms_max <- ggplot(plot_data, aes(x = ApartmentRooms, y = temp_max)) +
+  geom_point(size = 1.5, alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE,
+              linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~ heatwave_status, nrow = 1) +
+  labs(x = "Number of rooms", y = "Maximal indoor temperature (deg C)",
+       title = "Number of rooms") +
+  theme_minimal(base_size = 13) +
+  theme(strip.text = element_text(size = 11))
+
+combined_max <- (p_ac_max / p_fan_max / p_shade_max /
+                 p_insulation_max / p_toohot_max / p_rooms_max) +
+  plot_annotation(
+    title    = "Building characteristics and maximal indoor temperature across heatwave phases",
+    subtitle = "Each point represents one daily observation. P03, P14, P18, P23 excluded (no indoor sensor)."
+  )
+
+ggsave(
+  filename = here("RES/Environmental/Graph/building_characteristics_temp_max.png"),
+  plot     = combined_max,
+  width    = 22, height = 30, dpi = 600, device = "png"
+)
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
+

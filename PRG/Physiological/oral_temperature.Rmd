@@ -1,0 +1,607 @@
+---
+title: "Oral Temperature HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-04"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+<!--
+================================================================================
+SCRIPT:  PRG/Physiological/oral_temperature.Rmd
+PURPOSE: Full data preparation pipeline for oral temperature collected via oral probe device and smartwatch during the Montreal heatwave 2024.
+         This script:
+           1. Assigns participant IDs and study periods to raw oral temp data
+           2. Applies calibration correction (+2 deg C) to raw values
+           3. Flags and removes error and implausible measurements
+           4. Computes two delta variables:
+                - delta_oral_temp         : day-to-day lag change
+                                            used for plots and mixed models
+                - delta_oral_temp_baseline: deviation from individual
+                                            pre-heatwave mean used for descriptive statistics
+           5. Removes duplicate measurements using sleep-based reference times
+           6. Exports the clean final dataset and QC plots
+
+INPUT FILES (DAT/):
+  - oral_temperature.csv            -> raw thermometer measurements
+                                       Note: uses comma separator (sep=",")
+                                       unlike blood_pressure.csv (sep=";")
+  - baseline_long.csv               -> participant-macID-date lookup
+                                       (from Data_preparation.Rmd)
+  - sleep_analysis_daily.csv        -> daily sleep start/end times
+
+OUTPUT FILES (RES/Physiological/):
+  - oral_temp_processed.csv         -> cleaned dataset with both delta variables
+
+CALIBRATION NOTE:
+  A correction factor of +2 deg C is applied to all raw temperature values based on device calibration. Formula: temp_corrected = temp + 2.
+
+IMPLAUSIBLE VALUE THRESHOLDS:
+  Error flags      : temp_corrected < 30 or > 43 deg C
+  Implausible flags: temp_corrected < 34.5 or > 41 deg C
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+
+# Overview
+
+This script prepares the **oral temperature** dataset collected during the Montreal heatwave 2024. It follows the three-step pipeline
+defined in `Data_preparation.Rmd`:
+
+1. **`oral_temp_raw`** -- raw upload, calibration correction, participant ID assignment
+2. **`oral_temp_cleaned`** -- error flagging, implausible value removal, delta computation
+3. **`final_oral_temp_data`** -- deduplication via reference-time selection, export
+
+
+***
+
+# Environment setup
+
+## Load packages
+
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+required_packages <- c(
+  "here", "dplyr", "tidyr", "lubridate",
+  "ggplot2", "patchwork", "purrr"
+)
+
+install_if_missing <- function(packages) {
+  missing <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing) > 0) install.packages(missing)
+}
+
+install_if_missing(required_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+## Set project root and directory paths
+
+```{r Set Up environment, message=FALSE, warning=FALSE, include=FALSE}
+# Anchor here() to the project root from this script's location
+here::i_am("PRG/Physiological/oral_temperature.Rmd")  
+
+# Define paths using 'here' to get project-relative paths
+path_dat <- here("DAT")          # Path to the DAT folder within the project
+path_prg <- here("PRG")          # Path to the PRG folder within the project
+path_res <- here("DAT/Processed")          # Path to Processed folders in DAT
+```
+
+## Source custom functions
+
+```{r source-functions}
+# Participant ID assignment, period labelling, heatwave status
+source(here("PRG/Functions/functions_participant_period.R"))
+
+# Reference-time selection and deduplication (requires purrr)
+source(here("PRG/Functions/functions_cleaning_data.R"))
+
+# Night-period reference time adjustment
+source(here("PRG/Functions/functions_adjusted_ref_time.R"))
+```
+
+***
+
+# Step 1 - Load raw data and assign participant IDs {#step1}
+
+## Load raw oral temperature data
+
+```{r load-ot-raw}
+
+oral_temp_raw <- read.csv(
+  file.path(path_dat, "oral_temperature.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Load participant-macID lookup table
+
+```{r load-baseline-long}
+# baseline_long maps each macID + date range to a participant_id
+# Created by Data_preparation.Rmd must be run first
+baseline_long <- read.csv(
+  file.path(path_dat, "baseline_long.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Assign study period, participant ID, and heatwave status
+
+```{r assign-participant-period}
+# Step 1a: Convert unix timestamp and assign period of day (AM / PM / NI)
+oral_temp_participant <- assign_study_period(oral_temp_raw, c("unix"))
+
+# Step 1b: Create local_time from unix for participant ID matching
+# Applies EDT offset (-14400 s = UTC-4) for Montreal local time
+oral_temp_participant <- oral_temp_participant %>%
+  mutate(
+    local_time = as.POSIXct(unix, origin = "1970-01-01", tz = "UTC") - hours(4)
+  )
+
+# Step 1c: Match each row to a participant_id using macID + local_time window
+oral_temp_participant <- add_participant_id_watch(
+  oral_temp_participant,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+
+# Step 1d: Assign heatwave status (BEF_HW_June / HW_June / AFT_HW_June)
+oral_temp_participant <- assign_heatwave(oral_temp_participant)
+
+# Restrict to heatwave monitoring window only
+oral_temp_participant <- oral_temp_participant %>%
+  filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June"))
+```
+
+***
+
+# Step 2 - Calibration correction {#step2}
+
+All raw temperature values require a calibration adjustment of +2 deg C,
+determined during the device calibration process prior to the study.
+Formula: `temp_corrected = temp + 2`
+
+```{r apply-calibration}
+# Apply calibration correction to all temperature measurements
+oral_temp_participant <- oral_temp_participant %>%
+  mutate(temp_corrected = temp + 2)
+```
+
+***
+
+# Step 3 - Flag implausible and error measurements {#step3}
+
+Two levels of flagging are applied based on clinical thresholds.
+
+| Flag | Condition |
+|---|---|
+| `error_measurement` | temp_corrected < 30 or > 43 deg C |
+| `implausible_measurement` | temp_corrected < 34.5 or > 41 deg C |
+
+
+```{r flag-measurements}
+oral_temp_participant <- oral_temp_participant %>%
+  mutate(
+    # Hard error: physiologically impossible values
+    error_measurement       = ifelse(temp_corrected < 30 | temp_corrected > 43, 1, 0),
+    # Implausible: outside normal human oral temperature range
+    implausible_measurement = ifelse(temp_corrected < 34.5 | temp_corrected > 41, 1, 0)
+  )
+```
+
+## Visualize flagged measurements before removal
+
+```{r plot-before-filtering, echo=FALSE, fig.height=8, fig.width=15}
+
+oral_temp_data_subset <- oral_temp_participant %>%
+  mutate(
+    measurement_type = case_when(
+      error_measurement       == 1 ~ "Error",
+      implausible_measurement == 1 ~ "Implausible",
+      TRUE                         ~ "Valid"
+    ),
+    measurement_type = factor(measurement_type,
+                               levels = c("Valid", "Implausible", "Error")),
+    hour_of_day = hour(unix_time_converted)
+  )
+
+flag_colors <- c("Valid" = "#2E86AB", "Implausible" = "#F6AE2D", "Error" = "#E63946")
+flag_shapes <- c("Valid" = 16,        "Implausible" = 17,        "Error" = 4)
+
+line_oral_temp_complete_bef <- ggplot(
+  oral_temp_data_subset,
+  aes(x = date_converted, y = temp_corrected)
+) +
+  geom_jitter(aes(color = measurement_type, shape = measurement_type),
+              size = 0.8, alpha = 0.85, width = 0.2, height = 0) +
+  scale_color_manual(values = flag_colors, name = "Type") +
+  scale_shape_manual(values = flag_shapes, name = "Type") +
+  labs(title = "Before filtering",
+       x = "Date of measurement", y = "Oral temperature (deg C)") +
+  theme_minimal() +
+  theme(plot.title     = element_text(hjust = 0.5),
+        legend.position = "right",
+        axis.text.x    = element_text(angle = 45, hjust = 1, size = 10))
+print(line_oral_temp_complete_bef)
+```
+
+
+## Remove error and implausible measurements
+
+```{r remove-flagged}
+oral_temp_cleaned <- oral_temp_participant %>%
+  filter(error_measurement == 0, implausible_measurement == 0)
+
+n_removed   <- nrow(oral_temp_participant) - nrow(oral_temp_cleaned)
+pct_removed <- round((n_removed / nrow(oral_temp_participant)) * 100, 2)
+message("Rows removed (error + implausible): ", n_removed,
+        " (", pct_removed, "% of total)")
+```
+
+
+***
+
+# Step 4 - Compute delta variables {#step4}
+
+Two delta variables are computed and retained for different analytical purposes.
+
+## delta_oral_temp: day-to-day lag (for plots and mixed models)
+
+
+```{r compute-delta-lag}
+# Compute day-to-day change in oral temperature
+# Used for: time series visualizations and linear mixed models (MMRM)
+# Rationale: captures longitudinal fluctuation across the study period
+oral_temp_cleaned <- oral_temp_cleaned %>%
+  arrange(participant_id, date_converted, period) %>%
+  group_by(participant_id) %>%
+  mutate(
+    delta_oral_temp = temp_corrected - lag(temp_corrected)
+  ) %>%
+  ungroup() %>%
+  # First measurement per participant has no prior value -- set to 0
+  mutate(delta_oral_temp = ifelse(is.na(delta_oral_temp), 0, delta_oral_temp))
+```
+
+## delta_oral_temp_baseline: deviation from individual pre-heatwave mean (for descriptive tables)
+```{r compute-delta-baseline}
+# Step 1: Compute each participant's mean temperature during pre-heatwave period
+# This serves as the individual thermal baseline reference
+baseline_temp <- oral_temp_cleaned %>%
+  filter(heatwave_status == "BEF_HW_June") %>%
+  group_by(participant_id) %>%
+  summarise(
+    baseline_mean = mean(temp_corrected, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 2: Join baseline mean and compute deviation for every measurement
+# Used for: descriptive statistics tables (mean +/- SD per heatwave period)
+oral_temp_cleaned <- oral_temp_cleaned %>%
+  left_join(baseline_temp, by = "participant_id") %>%
+  mutate(delta_oral_temp_baseline = temp_corrected - baseline_mean)
+
+# Verify expected pattern: pre-HW mean delta should be approximately 0
+oral_temp_cleaned %>%
+  filter(heatwave_status %in% c("BEF_HW_June", "HW_June", "AFT_HW_June")) %>%
+  group_by(heatwave_status) %>%
+  summarise(
+    mean_delta_baseline = round(mean(delta_oral_temp_baseline, na.rm = TRUE), 2),
+    sd_delta_baseline   = round(sd(delta_oral_temp_baseline,   na.rm = TRUE), 2),
+    mean_delta_lag      = round(mean(delta_oral_temp,          na.rm = TRUE), 2),
+    sd_delta_lag        = round(sd(delta_oral_temp,            na.rm = TRUE), 2),
+    n                   = n()
+  )
+```
+
+***
+
+# Step 5 - Check and remove duplicate measurements {#step5}
+
+## Initial duplicate check
+
+```{r check-duplicates-initial, message=FALSE, warning=FALSE}
+duplicates_check <- oral_temp_cleaned %>%
+  group_by(period, macID, date_converted, participant_id) %>%
+  summarise(duplicate_count = n(), .groups = "drop") %>%
+  filter(duplicate_count > 1)
+
+if (nrow(duplicates_check) > 0) {
+  message("Duplicates found -- will resolve using reference time:")
+  print(duplicates_check)
+} else {
+  message("No duplicates found.")
+}
+```
+
+## Load and prepare sleep data for reference-time matching
+
+```{r load-sleep}
+sleep_analysis_raw <- read.csv(
+  file.path(path_dat, "sleep_analysis_daily.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+```{r assign-participant-sleep}
+# Derive local_time from sleepEnd for participant ID matching
+# EDT offset: -14400 seconds (UTC-4, valid for June 2024 Montreal)
+sleep_analysis_raw <- sleep_analysis_raw %>%
+  mutate(
+    local_time = as.Date(
+      as.POSIXct(sleepEnd, origin = "1970-01-01", tz = "UTC") - 14400
+    )
+  )
+
+sleep_analysis_participant <- add_participant_id_watch(
+  sleep_analysis_raw,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+```
+
+```{r filter-sleep, message=FALSE, warning=FALSE}
+# Convert Unix timestamps to local Montreal time and extract date components
+sleep_analysis_participant <- sleep_analysis_participant %>%
+  mutate(
+    sleepStart_time = as.POSIXct(sleepStart, origin = "1970-01-01", tz = "UTC") - 14400,
+    sleepEnd_time   = as.POSIXct(sleepEnd,   origin = "1970-01-01", tz = "UTC") - 14400,
+    date_bedtime    = as.Date(sleepStart_time),
+    date_awakening  = as.Date(sleepEnd_time)
+  ) %>%
+  # Restrict to heatwave monitoring window (June 9-29, 2024)
+  filter(
+    (sleepStart_time >= as.POSIXct("2024-06-09 00:00:00") &
+     sleepStart_time <= as.POSIXct("2024-06-29 23:59:59")) |
+    (sleepEnd_time   >= as.POSIXct("2024-06-09 00:00:00") &
+     sleepEnd_time   <= as.POSIXct("2024-06-29 23:59:59"))
+  )
+
+# Retain only physiologically plausible sleep episodes
+sleep_analysis_filter <- sleep_analysis_participant %>%
+  select(participant_id, macID, sleepStart, sleepEnd,
+         sleepStart_time, sleepEnd_time, date_bedtime, date_awakening) %>%
+  filter(
+    format(sleepEnd_time,    "%H:%M") >= "03:00" &
+    format(sleepEnd_time,    "%H:%M") <= "11:59" &
+    (format(sleepStart_time, "%H:%M") >= "18:00" |
+     format(sleepStart_time, "%H:%M") <= "02:59")
+  )
+
+n_sleep_removed <- nrow(sleep_analysis_participant) - nrow(sleep_analysis_filter)
+message("Sleep records retained: ", nrow(sleep_analysis_filter),
+        " | Removed (implausible windows): ", n_sleep_removed)
+```
+
+## Merge oral temperature and sleep data
+
+```{r merge-ot-sleep}
+# Align date keys: use date_awakening as merge date
+sleep_analysis_filter <- sleep_analysis_filter %>%
+  mutate(date_converted = date_awakening)
+
+# Left join: every oral temperature record is kept
+oral_temp_sleep_merged <- oral_temp_cleaned %>%
+  left_join(
+    sleep_analysis_filter,
+    by = c("macID", "participant_id", "date_converted")
+  )
+```
+
+## Assign reference times
+
+```{r set-reference-time}
+# Assigns reference_time per period:
+#   AM -> awakening time (sleepEnd_time)
+#   PM -> 15:00 on date_converted
+#   NI -> bedtime (sleepStart_time)
+oral_temp_sleep_merged <- set_reference_time(oral_temp_sleep_merged)
+```
+
+```{r adjust-night-reference-time}
+# Adjusts reference_time for NI measurements recorded after midnight
+oral_temp_sleep_merged <- set_adjusted_night_time(oral_temp_sleep_merged)
+```
+
+## Verify night reference time adjustment
+
+```{r verify-night-reference-time}
+# Compute time difference between NI measurements and adjusted bedtime
+oral_temp_night_verif <- oral_temp_sleep_merged %>%
+  filter(period == "NI") %>%
+  mutate(
+    time_diff_minutes = as.numeric(
+      difftime(unix_time_converted, adjusted_reference_time, units = "mins")
+    )
+  )
+
+time_diff_summary <- oral_temp_night_verif %>%
+  summarise(
+    mean_diff = mean(time_diff_minutes, na.rm = TRUE),
+    sd_diff   = sd(time_diff_minutes,   na.rm = TRUE),
+    min_diff  = min(time_diff_minutes,  na.rm = TRUE),
+    max_diff  = max(time_diff_minutes,  na.rm = TRUE)
+  )
+
+message(
+  "NI period -- time between measurement and adjusted bedtime (minutes):",
+  "\n  Mean = ", round(time_diff_summary$mean_diff, 2),
+  " | SD = ",   round(time_diff_summary$sd_diff,   2),
+  " | Min = ",  round(time_diff_summary$min_diff,  2),
+  " | Max = ",  round(time_diff_summary$max_diff,  2)
+)
+```
+
+## Select one measurement per participant per period
+
+
+```{r select-reference-measurement}
+# Number each measurement per group in descending unix order
+# row_num = 1 -> most recent; row_num > 1 -> older measurements to evaluate
+oral_temp_sleep_merged <- oral_temp_sleep_merged %>%
+  arrange(macID, period, date_converted, unix) %>%
+  group_by(macID, period, date_converted, participant_id) %>%
+  mutate(row_num = row_number(desc(unix))) %>%
+  ungroup()
+
+# Compute absolute time difference from reference_time for each measurement
+oral_temp_sleep_merged <- oral_temp_sleep_merged %>%
+  group_by(participant_id, date_converted, period) %>%
+  mutate(
+    abs_time_diff = abs(difftime(unix_time_converted, reference_time, units = "secs"))
+  ) %>%
+  ungroup()
+
+# Identify rows in groups with more than one measurement
+indices_row <- which(oral_temp_sleep_merged$row_num > 1)
+message("Rows in groups with multiple measurements: ", length(indices_row))
+
+# Retrieve surrounding indices for comparison within each group
+surrounding_indices_list <- get_surrounding_indices(indices_row, oral_temp_sleep_merged)
+
+# Keep only the measurement closest to the reference time per group
+final_oral_temp_data <- remove_farthest_measure(
+  oral_temp_sleep_merged,
+  surrounding_indices_list
+)
+
+n_removed_duplicates <- nrow(oral_temp_sleep_merged) - nrow(final_oral_temp_data)
+message("Rows removed (farthest from reference time): ", n_removed_duplicates)
+```
+
+
+## Final duplicate verification
+```{r check-duplicates-final, message=FALSE, warning=FALSE}
+duplicates_final <- final_oral_temp_data %>%
+  group_by(period, macID, date_converted) %>%
+  summarise(duplicate_count = n(), .groups = "drop") %>%
+  filter(duplicate_count > 1)
+
+if (nrow(duplicates_final) > 0) {
+  message("WARNING: Duplicates still present:")
+  print(duplicates_final)
+} else {
+  message("Final duplicate check passed: one measurement per participant per period per date.")
+}
+```
+
+***
+
+# Step 6 - Final dataset and export {#step6}
+
+## Remove intermediate processing columns
+
+```{r clean-final-columns}
+
+
+final_oral_temp_data <- final_oral_temp_data %>%
+  select(
+    -id, -tz, -adc, -ta, -rh, -measures, -local_date,
+    -error_measurement, -implausible_measurement,
+    -matches("^[Ss]leep"),
+    -date_bedtime, -date_awakening,
+    -hours_discrepancy, -adjusted_reference_time,
+    -abs_time_diff, -reference_time,
+    -local_time, -row_num,
+    -baseline_mean, -time_diff_minutes, -unix, -temp                # Intermediate variable used to compute
+                                  # delta_oral_temp_baseline -- not needed in output
+  )
+```
+
+## Export processed dataset
+
+```{r export-final}
+output_file <- file.path(path_res, "oral_temp_processed.csv")
+write.csv(final_oral_temp_data, output_file, row.names = FALSE)
+message("Exported: oral_temp_processed.csv (",
+        nrow(final_oral_temp_data), " rows x ",
+        ncol(final_oral_temp_data), " columns)")
+```
+
+***
+
+# Step 7 - Quality control plots {#step7}
+
+## Before vs. after filtering: temperature over time
+
+```{r plot-timeseries-after, echo=FALSE}
+line_oral_temp_complete_aft <- ggplot(
+  final_oral_temp_data,
+  aes(x = date_converted, y = temp_corrected)
+) +
+  geom_jitter(color = "#2E86AB",   # Fixed color outside aes() to avoid legend artefact
+              size = 0.8, alpha = 0.85, width = 0.2, height = 0) +
+  labs(title = "After filtering",
+       x = "Date of measurement", y = "Oral temperature (deg C)") +
+  theme_minimal() +
+  theme(plot.title      = element_text(hjust = 0.5),
+        legend.position = "right",
+        axis.text.x     = element_text(angle = 45, hjust = 1, size = 10))
+
+line_oral_temp_complete_bef / line_oral_temp_complete_aft +
+  plot_annotation(title = "Effect of data cleaning on oral temperature")
+```
+## Distribution of delta oral temperature after filtering
+
+```{r plot-histogram-after, echo=FALSE}
+histo_oral_tp_aft <- ggplot(final_oral_temp_data, aes(x = delta_oral_temp)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 fill = "lightblue", color = "grey", bins = 30) +
+  labs(title = "After filtering",
+       x = "Daily change in oral temperature (deg C)", y = "Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(histo_oral_tp_aft)
+```
+
+
+## Boxplots by period of day: before vs. after filtering
+
+```{r plot-boxplots-before-after, echo=FALSE}
+bxp_oral_tp_bef <- ggplot(
+  oral_temp_cleaned,
+  aes(x = period, y = delta_oral_temp, fill = period)
+) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.3) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1, color = "grey2") +
+  labs(title = "Before filtering", x = "", y = "Daily change in oral temperature (deg C)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+bxp_oral_tp_aft <- ggplot(
+  final_oral_temp_data,
+  aes(x = period, y = delta_oral_temp, fill = period)
+) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.3) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1, color = "grey2") +
+  labs(title = "After filtering", x = "", y = "Daily change in oral temperature (deg C)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+bxp_oral_tp_bef / bxp_oral_tp_aft +
+  plot_annotation(title = "Effect of data cleaning on delta oral temperature by period")
+```
+
+
+***
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
+

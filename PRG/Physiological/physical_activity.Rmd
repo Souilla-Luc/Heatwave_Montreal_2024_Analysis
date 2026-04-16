@@ -1,0 +1,360 @@
+---
+title: "Physical Activity HeatSuite 2024"
+author: "Souilla Luc"
+date: "2026-03-04"
+output:   
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+encoding: UTF-8
+---
+
+<!--
+================================================================================
+SCRIPT:  PRG/Physiological/physical_activity.Rmd
+PURPOSE: Data preparation pipeline for physical activity (acceleration) collected via smartwatch during the Montreal heatwave 2024.
+         This script:
+           1. Assigns participant IDs to raw minute-level acceleration data
+           2. Corrects heatwave misclassification for NI period measurements
+           3. Aggregates to daily mean acceleration (mg) excluding charging periods
+           4. Checks for duplicate entries per participant per day
+           5. Exports the clean final dataset and QC plots
+
+INPUT FILES (DAT/):
+  - minData.csv                     -> raw minute-level smartwatch acceleration
+                                
+  - baseline_long.csv               -> participant-macID-date lookup
+                                       (from Data_preparation.Rmd)
+
+OUTPUT FILES (RES/Physiological/):
+  - daily_physical_activity_processed.csv -> cleaned daily mean acceleration
+
+OUTCOME VARIABLE:
+  mean_acc_day: mean raw wrist acceleration magnitude (mg) over 24h
+  Computed as the mean of minute-level acc_avg values (converted from g to mg) across all non-charging minutes in a calendar day.
+
+  n_minutes_worn: number of non-charging minutes per day, retained in the output to allow quality filtering of days with insufficient wear time. If participants do not worn the watch for at least 10h (600 minutes) in a day, that day is excluded from the final dataset.
+
+HEATWAVE PERIODS (consistent with assign_heatwave() in functions_participant_period.R):
+  Before heatwave : 2024-06-11 to 2024-06-17
+  During heatwave : 2024-06-18 to 2024-06-20
+  After heatwave  : 2024-06-21 to 2024-06-27
+
+================================================================================
+-->
+
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, suppress messages and warnings
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This script prepares the **physical activity** dataset from minute-level
+smartwatch acceleration data collected during the Montreal Summer 2024
+heatwave study.
+
+Daily physical activity is expressed as the **mean raw wrist acceleration magnitude (mg)**, computed by averaging minute-level acceleration values (`acc_avg`, converted from g to mg) over all non-charging minutes in a 24-hour period.
+
+A specific correction is applied to fix heatwave misclassification for NI period measurements that occur after midnight. See the header block for full rationale.
+
+
+***
+
+# Environment setup
+
+## Load packages
+
+```{r load-packages, message=FALSE, warning=FALSE, include=FALSE}
+required_packages <- c(
+  "here", "dplyr", "tidyr", "lubridate",
+  "ggplot2", "patchwork"
+)
+
+install_if_missing <- function(packages) {
+  missing <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(missing) > 0) install.packages(missing)
+}
+
+install_if_missing(required_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+
+## Set project root and directory paths
+
+```{r set-paths}
+# Anchor here() to the project root from this script's location
+here::i_am("PRG/Physiological/physical_activity.Rmd")
+
+path_dat <- here("DAT")                  # Raw data folder
+path_prg <- here("PRG")                  # Scripts folder
+path_res <- here("DAT/Processed")         # Path to the Processed folder within the project
+```
+
+
+## Source custom functions
+
+```{r source-functions}
+# Participant ID assignment, period labelling, heatwave status
+source(here("PRG/Functions/functions_participant_period.R"))
+```
+
+***
+
+# Step 1 - Load raw data and assign participant IDs {#step1}
+
+## Load raw minute-level acceleration data
+
+
+```{r load-pa-raw}
+# Load raw minute-level acceleration data from smartwatch
+physical_activity_data_raw <- read.csv(
+  file.path(path_dat, "minData.csv"),
+  header = TRUE, sep = ";", quote = "\"'", dec = "."
+)
+```
+
+## Load participant-macID lookup table
+
+```{r load-baseline-long}
+# baseline_long maps each macID + date range to a participant_id
+# Created by Data_preparation.Rmd -- must be run first
+baseline_long <- read.csv(
+  file.path(path_dat, "baseline_long.csv"),
+  header = TRUE, sep = ",", quote = "\"'", dec = "."
+)
+```
+
+## Assign participant ID and study period
+```{r PA-assign-participant}
+# Step 1a: assign_study_period() called FIRST to create unix_time_converted
+# and period (AM/PM/NI) columns before participant ID matching
+activity_data_participant <- assign_study_period(
+  physical_activity_data_raw, c("unix")
+)
+
+# Step 1b: Match each row to a participant_id using macID + local_time
+activity_data_participant <- add_participant_id_watch(
+  activity_data_participant,
+  baseline_long,
+  mac_col  = "macID",
+  time_col = "local_time"
+)
+
+# Step 1c: Add date_converted for grouping
+activity_data_participant <- activity_data_participant %>%
+  mutate(date_converted = as.Date(unix_time_converted))
+
+```
+
+## Assign heatwave status
+
+```{r PA-assign-heatwave}
+# Assign initial heatwave status using assign_heatwave()
+# No heatwave filter applied here -- filtering happens after the NI
+# misclassification correction in Step 2, which requires boundary dates
+activity_data_participant <- assign_heatwave(activity_data_participant)
+```
+
+
+***
+
+# Step 2 - Correct NI heatwave misclassification {#step2}
+
+
+The NI (night) period spans 18:00 to 02:59 the following calendar day.
+`assign_heatwave()` classifies records by calendar date, which means a NI measurement at 01:00 on June 18 receives `HW_June` status when it physiologically belongs to the evening of June 17 (`BEF_HW_June`).
+
+The correction: for NI rows whose `date_converted` falls outside all valid heatwave date ranges, subtract one day before reclassifying.
+
+```{r PA-correct-heatwave-NI}
+activity_data_corrected <- activity_data_participant %>%
+  select(-heatwave_status) %>%
+  mutate(
+    # Flag NI dates outside any valid heatwave range
+    not_in_heatwave_range = !(
+      (date_converted >= as.Date("2024-06-11") & date_converted <  as.Date("2024-06-18")) |
+      (date_converted >= as.Date("2024-06-18") & date_converted <= as.Date("2024-06-20")) |
+      (date_converted >  as.Date("2024-06-20") & date_converted <= as.Date("2024-06-27"))
+    ),
+    # For NI rows outside any range: subtract one day to correct the date
+    # For all other rows: keep the original date
+    adjusted_date = if_else(
+      period == "NI" & not_in_heatwave_range,
+      date_converted - 1,
+      date_converted
+    ),
+    # Reclassify heatwave status using the corrected date
+    # Dates consistent with assign_heatwave() in functions_participant_period.R
+    heatwave_status = case_when(
+      adjusted_date >= as.Date("2024-06-18") & adjusted_date <= as.Date("2024-06-20") ~ "HW_June",
+      adjusted_date >= as.Date("2024-06-11") & adjusted_date <  as.Date("2024-06-18") ~ "BEF_HW_June",
+      adjusted_date >  as.Date("2024-06-20") & adjusted_date <= as.Date("2024-06-27") ~ "AFT_HW_June",
+      TRUE ~ "NoHW"
+    )
+  ) %>%
+  filter(heatwave_status != "NoHW") %>%
+  select(-not_in_heatwave_range) %>%
+  ungroup()
+
+n_removed <- nrow(activity_data_participant) - nrow(activity_data_corrected)
+message("Rows removed (outside heatwave window): ", n_removed)
+```
+
+
+***
+# Step 3 - Aggregate to daily mean acceleration {#step3}
+
+Minute-level data is aggregated directly to daily mean acceleration (mg). Charging minutes are **excluded** rather than set to 0 because including zeros would artificially deflate the mean. The number of valid non-charging minutes per day is retained as `n_minutes_worn` to allow quality filtering of days with insufficient wear time if needed.
+
+```{r PA-aggregate-daily}
+final_activity_data_day <- activity_data_corrected %>%
+  filter(charging == "false") %>%            # Exclude charging minutes
+  mutate(acc_avg_mg = acc_avg * 1000) %>%  # Convert g to mg
+  group_by(macID, participant_id, date_converted, heatwave_status) %>%
+  summarise(
+    # Mean raw wrist acceleration magnitude over non-charging minutes (mg)
+    mean_acc_day   = mean(acc_avg_mg, na.rm = TRUE),
+    # Number of valid (non-charging) minutes -- use to flag low wear-time days
+    n_minutes_worn = n(),
+    .groups = "drop"
+  ) %>%
+  # Convention: period = "AM" for daily data to match other dataframes
+  mutate(period = "AM")
+
+message("Daily records created: ", nrow(final_activity_data_day))
+message("Mean wear time per day: ",
+        round(mean(final_activity_data_day$n_minutes_worn), 0), " minutes")
+message("Mean daily acceleration: ",
+        round(mean(final_activity_data_day$mean_acc_day, na.rm = TRUE), 1), " mg")
+```
+
+
+```{r}
+#Wear time was capped at 1440 minutes per day to account for minor timestamp overlap at day boundaries.
+
+final_activity_data_day <- final_activity_data_day %>%
+  mutate(n_minutes_worn = pmin(n_minutes_worn, 1440))%>%
+  filter(n_minutes_worn >= 600) # Days excluded if not worn for 10h 
+n_excluded <- sum(final_activity_data_day$n_minutes_worn < 600, na.rm = TRUE)
+message("Days excluded (wear time < 10h): ", n_excluded)
+```
+
+***
+
+# Step 4 - Check for duplicate entries {#step4}
+
+Each participant should have at most one entry per day after aggregation.
+
+```{r PA-check-duplicates, message=FALSE, warning=FALSE}
+duplicates_check <- final_activity_data_day %>%
+  group_by(period, macID, date_converted, participant_id) %>%
+  summarise(duplicate_count = n(), .groups = "drop") %>%
+  filter(duplicate_count > 1)
+
+if (nrow(duplicates_check) > 0) {
+  message("WARNING: Duplicates found in daily dataset:")
+  print(duplicates_check)
+} else {
+  message("Duplicate check passed: one entry per participant per day.")
+}
+```
+
+***
+
+# Step 5 - Export {#step5}
+
+```{r PA-export}
+output_file <- file.path(path_res, "daily_physical_activity_processed.csv")
+write.csv(final_activity_data_day, output_file, row.names = FALSE)
+message("Exported: daily_physical_activity_processed.csv (",
+        nrow(final_activity_data_day), " rows x ",
+        ncol(final_activity_data_day), " columns)")
+```
+
+***
+
+# Step 6 - Quality control plots {#step6}
+
+## Daily mean acceleration over time
+
+```{r plot-timeseries, echo=FALSE}
+line_activity_aft <- ggplot(
+  final_activity_data_day,
+  aes(x = date_converted, y = mean_acc_day)
+) +
+  geom_jitter(alpha = 0.8, size = 0.8, width = 0.2) +
+  labs(title = "After filtering",
+       x = "", y = "Mean acceleration per day (mg)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+print(line_activity_aft)
+```
+
+## Distribution of daily mean acceleration
+
+```{r plot-histogram, echo=FALSE}
+histo_activity_aft <- ggplot(
+  final_activity_data_day,
+  aes(x = mean_acc_day)
+) +
+  geom_histogram(aes(y = after_stat(density)),
+                 fill = "lightblue", color = "grey", bins = 30) +
+  labs(title = "After filtering",
+       x = "Mean acceleration per day (mg)", y = "Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(histo_activity_aft)
+```
+
+## Boxplot by heatwave period
+
+```{r plot-boxplot, echo=FALSE}
+bxp_activity_aft <- ggplot(
+  final_activity_data_day,
+  aes(x = heatwave_status, y = mean_acc_day, fill = heatwave_status)
+) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.2) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1, color = "grey2") +
+  labs(title = "After filtering",
+       x = "", y = "Mean acceleration per day (mg)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+print(bxp_activity_aft)
+```
+
+## Wear time distribution
+
+```{r plot-wear-time, echo=FALSE}
+# Verify wear time distribution -- flag participants with low daily wear time
+# Dashed line at 600 minutes (10h) as a common minimum threshold in literature
+histo_wear <- ggplot(
+  final_activity_data_day,
+  aes(x = n_minutes_worn)
+) +
+  geom_histogram(fill = "lightblue", color = "grey", bins = 30) +
+  geom_vline(xintercept = 600, linetype = "dashed", color = "#E63946") +
+  annotate("text", x = 620, y = Inf, vjust = 2, hjust = 0,
+           label = "10h minimum threshold", size = 3, color = "#E63946") +
+  labs(title = "Daily wear time distribution",
+       x = "Minutes worn per day", y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(histo_wear)
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
