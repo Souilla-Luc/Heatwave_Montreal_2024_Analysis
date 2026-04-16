@@ -6,7 +6,7 @@
 This repository contains the complete analysis code for the **Heatwave Montreal 2024** study, a longitudinal field study examining the environmental, physiological, perceptual and behavioral effects of an heatwave on community-dwelling older adults residing in social housing in Montreal, Quebec, Canada (June 2024).
 
 > **Data availability:** Raw and processed datasets are not included in this repository. Processed data are publicly available at [INSERT DATA REPOSITORY LINK — ].  
-> To reproduce the analyses, download the data, place the files in the `DAT/Processed` folder as described below, and run the scripts in the order listed in the [Execution Order](#execution-order) section.
+> To reproduce the analyses, download the data, place the files in the `DAT/Processed` folder as described below, and run the scripts in the order listed in the [Execution Order](#execution-order) section. Create the DAT/ and RES/ folders as described in the Setup section before running the scripts.
 
 ---
 
